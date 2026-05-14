@@ -648,6 +648,16 @@ pub fn get_bootstrap_cache_stats() -> Result<(usize, bool), DomainCheckError> {
 mod tests {
     use super::*;
 
+    // Serializes tests that touch the global bootstrap cache so parallel
+    // execution doesn't let one test's `clear_bootstrap_cache()` wipe another
+    // test's freshly cached entry before its assertion runs.
+    fn cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // ── extract_tld ─────────────────────────────────────────────────────
 
     #[test]
@@ -794,6 +804,7 @@ mod tests {
 
     #[test]
     fn test_whois_server_caching() {
+        let _guard = cache_test_lock();
         clear_bootstrap_cache().unwrap();
 
         cache_whois_server("com", "whois.verisign-grs.com").unwrap();
@@ -807,6 +818,7 @@ mod tests {
 
     #[test]
     fn test_whois_negative_caching() {
+        let _guard = cache_test_lock();
         clear_bootstrap_cache().unwrap();
 
         cache_whois_server("fake", "").unwrap();
@@ -818,6 +830,7 @@ mod tests {
 
     #[test]
     fn test_whois_cache_case_insensitive() {
+        let _guard = cache_test_lock();
         clear_bootstrap_cache().unwrap();
 
         cache_whois_server("COM", "whois.verisign-grs.com").unwrap();
@@ -831,6 +844,7 @@ mod tests {
 
     #[test]
     fn test_whois_not_negatively_cached_when_absent() {
+        let _guard = cache_test_lock();
         clear_bootstrap_cache().unwrap();
         assert!(!is_whois_negatively_cached("neverqueried"));
         clear_bootstrap_cache().unwrap();
@@ -840,6 +854,7 @@ mod tests {
 
     #[test]
     fn test_clear_bootstrap_cache() {
+        let _guard = cache_test_lock();
         // Populate some data
         cache_whois_server("test", "whois.test.com").unwrap();
         clear_bootstrap_cache().unwrap();
@@ -850,6 +865,7 @@ mod tests {
 
     #[test]
     fn test_get_bootstrap_cache_stats() {
+        let _guard = cache_test_lock();
         clear_bootstrap_cache().unwrap();
         let (count, stale) = get_bootstrap_cache_stats().unwrap();
         assert_eq!(count, 0);
