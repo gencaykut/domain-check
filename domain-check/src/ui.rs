@@ -123,6 +123,13 @@ pub fn print_custom_help() {
     print_flag("", "--max-length <N>", "Maximum generated label length");
     print_flag(
         "",
+        "--contains <TEXT>",
+        "Require text anywhere in the label",
+    );
+    print_flag("", "--starts-with <TEXT>", "Require a label prefix");
+    print_flag("", "--ends-with <TEXT>", "Require a label suffix");
+    print_flag(
+        "",
         "--score-only",
         "Score candidates without network checks",
     );
@@ -156,6 +163,16 @@ pub fn print_custom_help() {
     );
     print_flag("", "--no-whois", "Disable automatic WHOIS fallback");
 
+    // HISTORY
+    print_section("HISTORY");
+    print_flag("", "--no-history", "Disable persistent query history");
+    print_flag(
+        "",
+        "--history-file <PATH>",
+        "Use a custom JSONL history file",
+    );
+    print_flag("", "--clear-history", "Clear query history and exit");
+
     // CONFIGURATION
     print_section("CONFIGURATION");
     print_flag("", "--config <FILE>", "Use specific config file");
@@ -166,6 +183,7 @@ pub fn print_custom_help() {
     print_section("GENERAL");
     print_flag("-h", "--help", "Show this help message");
     print_flag("-V", "--version", "Show version");
+    print_flag("", "--interactive", "Run the candidate wizard");
 
     // EXAMPLES
     print_section("EXAMPLES");

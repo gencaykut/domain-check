@@ -3,7 +3,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
-use tempfile::NamedTempFile;
+use tempfile::{tempdir, NamedTempFile};
 
 /// Helper to create a test domains file
 fn create_test_domains_file(domains: &[&str]) -> NamedTempFile {
@@ -52,7 +52,133 @@ fn test_help_shows_premium_generation_flags() {
         .stdout(predicate::str::contains("--length <N>"))
         .stdout(predicate::str::contains("--min-length <N>"))
         .stdout(predicate::str::contains("--max-length <N>"))
+        .stdout(predicate::str::contains("--contains <TEXT>"))
+        .stdout(predicate::str::contains("--starts-with <TEXT>"))
+        .stdout(predicate::str::contains("--ends-with <TEXT>"))
         .stdout(predicate::str::contains("--score-only"));
+}
+
+#[test]
+fn test_generated_text_filters_and_determinism() {
+    let cases = [
+        ("--contains", "ar"),
+        ("--starts-with", "la"),
+        ("--ends-with", "ra"),
+    ];
+    for (flag, value) in cases {
+        let args = [
+            "--generate",
+            "30000",
+            "--top",
+            "20",
+            "--length",
+            "5",
+            flag,
+            value,
+            "--score-only",
+        ];
+        let first = Command::cargo_bin("domain-check")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        let second = Command::cargo_bin("domain-check")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(first.status.success(), "{flag}: {:?}", first.stderr);
+        assert_eq!(first.stdout, second.stdout);
+        for line in String::from_utf8(first.stdout).unwrap().lines() {
+            let label = line.split('.').next().unwrap();
+            match flag {
+                "--contains" => assert!(label.contains(value)),
+                "--starts-with" => assert!(label.starts_with(value)),
+                "--ends-with" => assert!(label.ends_with(value)),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_history_file_reuses_result_without_new_query() {
+    let dir = tempdir().unwrap();
+    let history = dir.path().join("history.jsonl");
+    fs::write(
+        &history,
+        "{\"domain\":\"cached-example.com\",\"status\":\"AVAILABLE\",\"method\":\"whois\",\"timestamp\":4102444800}\n",
+    )
+    .unwrap();
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "cached-example.com",
+            "--history-file",
+            history.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AVAILABLE"))
+        .stdout(predicate::str::contains("0 new queries"))
+        .stdout(predicate::str::contains("1 reused"));
+}
+
+#[test]
+fn test_clear_history_uses_custom_path_and_exits() {
+    let dir = tempdir().unwrap();
+    let history = dir.path().join("history.jsonl");
+    fs::write(&history, "record\n").unwrap();
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--clear-history",
+            "--history-file",
+            history.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cleared history"));
+    assert!(!history.exists());
+}
+
+#[test]
+fn test_no_history_does_not_create_custom_history_file() {
+    let dir = tempdir().unwrap();
+    let history = dir.path().join("disabled.jsonl");
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "example.com",
+            "--no-history",
+            "--history-file",
+            history.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(!history.exists());
+}
+
+#[test]
+fn test_interactive_wizard_accepts_simulated_stdin() {
+    let mut cmd = Command::cargo_bin("domain-check").unwrap();
+    cmd.arg("--interactive")
+        .write_stdin("5\nai\n1\n5000\n20\ncom\n1\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Domain candidate wizard"))
+        .stdout(predicate::str::contains(".com"));
+}
+
+#[test]
+fn test_no_args_with_non_tty_stdin_does_not_block() {
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .write_stdin("")
+        .timeout(std::time::Duration::from_secs(3))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("You must specify"));
 }
 
 #[test]

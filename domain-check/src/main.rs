@@ -3,20 +3,26 @@
 //! A command-line interface for checking domain availability using RDAP and WHOIS protocols.
 //! This CLI application provides a user-friendly interface to the domain-check-lib library.
 
+mod history;
+mod interactive;
 mod ui;
 
 use clap::Parser;
 use console::Term;
+#[cfg(test)]
+use domain_check_lib::generate_premium_candidates;
 use domain_check_lib::{
-    generate_premium_candidates, normalize_tld, score_domain, CandidateGenerationConfig,
-    CheckConfig, DomainChecker, DomainResult, ScoredCandidate,
+    generate_premium_candidates_with_filters_and_stats, normalize_tld, score_domain,
+    CandidateGenerationConfig, CandidateGenerationFilters, CheckConfig, DomainChecker,
+    DomainResult, ScoredCandidate,
 };
 use domain_check_lib::{
     get_all_known_tlds, get_available_presets, get_preset_tlds, get_preset_tlds_with_custom,
     initialize_bootstrap,
 };
 use domain_check_lib::{load_env_config, ConfigManager, FileConfig};
-use std::io::BufRead;
+use std::io::{BufRead, IsTerminal};
+use std::path::PathBuf;
 use std::process;
 
 /// CLI arguments for domain-check
@@ -126,6 +132,30 @@ pub struct Args {
     )]
     pub max_length: Option<usize>,
 
+    /// Require generated second-level labels to contain this text
+    #[arg(
+        long = "contains",
+        value_name = "TEXT",
+        help_heading = "Domain Generation"
+    )]
+    pub contains: Option<String>,
+
+    /// Require generated second-level labels to start with this text
+    #[arg(
+        long = "starts-with",
+        value_name = "TEXT",
+        help_heading = "Domain Generation"
+    )]
+    pub starts_with: Option<String>,
+
+    /// Require generated second-level labels to end with this text
+    #[arg(
+        long = "ends-with",
+        value_name = "TEXT",
+        help_heading = "Domain Generation"
+    )]
+    pub ends_with: Option<String>,
+
     /// Output generated candidates and scores without network checks
     #[arg(long = "score-only", help_heading = "Domain Generation")]
     pub score_only: bool,
@@ -183,6 +213,22 @@ pub struct Args {
     #[arg(long = "no-whois", help_heading = "Protocol")]
     pub no_whois: bool,
 
+    /// Disable persistent local query history
+    #[arg(long = "no-history", help_heading = "History")]
+    pub no_history: bool,
+
+    /// Use a custom JSONL history path
+    #[arg(long = "history-file", value_name = "PATH", help_heading = "History")]
+    pub history_file: Option<PathBuf>,
+
+    /// Clear query history and exit
+    #[arg(long = "clear-history", help_heading = "History")]
+    pub clear_history: bool,
+
+    /// Force the interactive wizard (primarily useful with piped input)
+    #[arg(long = "interactive", help_heading = "General")]
+    pub interactive: bool,
+
     /// Use specific config file instead of automatic discovery
     #[arg(long = "config", value_name = "FILE", help_heading = "Configuration")]
     pub config: Option<String>,
@@ -198,11 +244,36 @@ pub struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Handle --help before anything else
     if args.help {
         ui::print_custom_help();
+        return;
+    }
+
+    let no_work_input = args.domains.is_empty()
+        && args.file.is_none()
+        && args.patterns.is_none()
+        && args.generate_count.is_none();
+    if args.interactive || (no_work_input && !args.clear_history && std::io::stdin().is_terminal())
+    {
+        if let Err(error) = interactive::run_wizard(&mut args) {
+            eprintln!("Error: {error}");
+            process::exit(1);
+        }
+    }
+
+    if args.clear_history {
+        let path = history_path(&args);
+        if let Err(error) = history::HistoryStore::clear(&path) {
+            eprintln!(
+                "Error: could not clear history '{}': {error}",
+                path.display()
+            );
+            process::exit(1);
+        }
+        println!("Cleared history: {}", path.display());
         return;
     }
 
@@ -241,7 +312,7 @@ async fn main() {
 /// Validate command line arguments
 fn validate_args(args: &Args) -> Result<(), String> {
     // --list-presets is self-contained, skip other validation
-    if args.list_presets {
+    if args.list_presets || args.clear_history {
         return Ok(());
     }
 
@@ -288,16 +359,17 @@ fn validate_args(args: &Args) -> Result<(), String> {
             }
         }
         validate_generation_lengths(args)?;
+        validate_generation_filters(args)?;
     } else if args.top.is_some()
         || args.score_only
         || args.length.is_some()
         || args.min_length.is_some()
         || args.max_length.is_some()
+        || args.contains.is_some()
+        || args.starts_with.is_some()
+        || args.ends_with.is_some()
     {
-        return Err(
-            "--top, --score-only, --length, --min-length, and --max-length require --generate"
-                .to_string(),
-        );
+        return Err("--top, --score-only, length, and text filters require --generate".to_string());
     }
 
     if args.score_only && args.dry_run {
@@ -341,6 +413,21 @@ fn validate_args(args: &Args) -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+fn validate_generation_filters(args: &Args) -> Result<(), String> {
+    for (flag, value) in [
+        ("--contains", args.contains.as_deref()),
+        ("--starts-with", args.starts_with.as_deref()),
+        ("--ends-with", args.ends_with.as_deref()),
+    ] {
+        if let Some(value) = value {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                return Err(format!("{flag} must contain ASCII letters only"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -407,7 +494,18 @@ fn should_enable_bootstrap(args: &Args, _resolved_tlds: &Option<Vec<String>>) ->
 
 /// Main domain checking logic
 async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let generated = generated_candidates_from_args(&args)?;
+    let mut history_store = if args.no_history || args.score_only {
+        None
+    } else {
+        Some(history::HistoryStore::load(history_path(&args))?)
+    };
+    let history_exclusions = history_store
+        .as_ref()
+        .map(history::HistoryStore::reusable_domains)
+        .unwrap_or_default();
+    let generated = generated_candidates_from_args(&args, history_exclusions)?;
+    let generated_history_skipped = generated.history_skipped;
+    let generated = generated.candidates;
     if args.score_only {
         display_score_only(generated.as_deref().unwrap_or_default(), &args)?;
         return Ok(());
@@ -457,6 +555,23 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
         return Ok(());
     }
 
+    let requested_domains = deduplicate_domains(domains);
+    let duplicate_count = requested_domains.1;
+    let requested_domains = requested_domains.0;
+    let (cached_results, domains) = if let Some(store) = history_store.as_ref() {
+        let selection = store.select(requested_domains.clone());
+        (selection.cached, selection.pending)
+    } else {
+        (Vec::new(), requested_domains.clone())
+    };
+    let history_stats = HistoryStats {
+        enabled: !args.no_history,
+        history_skipped: generated_history_skipped + cached_results.len(),
+        new_queries: domains.len(),
+        history_reused: cached_results.len(),
+        duplicates_skipped: duplicate_count,
+    };
+
     // Interactive confirmation for large runs (TTY only)
     if domains.len() > 5000 && !args.force && !args.yes {
         let term = Term::stderr();
@@ -482,17 +597,80 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
     let checker = DomainChecker::with_config(config.clone());
 
     // Decide on processing mode based on domain count and user preferences
-    let use_streaming = should_use_streaming(&args, domains.len());
+    let use_streaming = should_use_streaming(&args, requested_domains.len());
 
     if use_streaming {
         // Streaming mode for multiple domains - show progress and real-time results
-        run_streaming_check(&checker, &domains, &args, &config.tlds).await?;
+        run_streaming_check(
+            &checker,
+            &domains,
+            cached_results,
+            &args,
+            &config.tlds,
+            history_store.as_mut(),
+            history_stats,
+        )
+        .await?;
     } else {
         // Batch mode for single domains or when explicitly requested
-        run_batch_check(&checker, &domains, &args).await?;
+        run_batch_check(
+            &checker,
+            &domains,
+            cached_results,
+            &requested_domains,
+            &args,
+            history_store.as_mut(),
+            history_stats,
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HistoryStats {
+    enabled: bool,
+    history_skipped: usize,
+    new_queries: usize,
+    history_reused: usize,
+    duplicates_skipped: usize,
+}
+
+fn history_path(args: &Args) -> PathBuf {
+    args.history_file
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(history::DEFAULT_HISTORY_FILE))
+}
+
+fn deduplicate_domains(domains: Vec<String>) -> (Vec<String>, usize) {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::with_capacity(domains.len());
+    let mut duplicates = 0;
+    for domain in domains {
+        let normalized = history::normalize_domain(&domain);
+        if seen.insert(normalized.clone()) {
+            unique.push(normalized);
+        } else {
+            duplicates += 1;
+        }
+    }
+    (unique, duplicates)
+}
+
+fn print_history_stats(stats: HistoryStats, structured: bool) {
+    if !stats.enabled {
+        return;
+    }
+    let line = format!(
+        "History: {} skipped, {} new queries, {} reused, {} duplicate inputs removed",
+        stats.history_skipped, stats.new_queries, stats.history_reused, stats.duplicates_skipped
+    );
+    if structured {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
 }
 
 /// Determine whether to use streaming or batch mode
@@ -520,8 +698,11 @@ fn should_use_streaming(args: &Args, domain_count: usize) -> bool {
 async fn run_streaming_check(
     checker: &DomainChecker,
     domains: &[String],
+    cached_results: Vec<DomainResult>,
     args: &Args,
     tlds: &Option<Vec<String>>,
+    history_store: Option<&mut history::HistoryStore>,
+    history_stats: HistoryStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use futures_util::StreamExt;
 
@@ -562,9 +743,28 @@ async fn run_streaming_check(
     let mut unknown_count = 0;
     let mut results = Vec::new();
     let mut completed = 0usize;
-    let total = domains.len();
+    let total = domains.len() + cached_results.len();
 
     let start_time = std::time::Instant::now();
+
+    for cached in cached_results {
+        match cached.available {
+            Some(true) => available_count += 1,
+            Some(false) => taken_count += 1,
+            None => unknown_count += 1,
+        }
+        completed += 1;
+        let counter = (total > 1).then_some((completed, total));
+        if args.pretty {
+            ui::print_result(&cached, args.info, args.debug, counter);
+        } else {
+            ui::print_result_default(&cached, args.info, args.debug, counter);
+        }
+        if args.score {
+            ui::print_investment_score(&score_domain(&cached.domain));
+        }
+        results.push(cached);
+    }
 
     // Process each domain individually to preserve context
     let domain_futures = domains.iter().map(|domain| {
@@ -590,6 +790,7 @@ async fn run_streaming_check(
         futures_util::stream::iter(domain_futures).buffer_unordered(checker.config().concurrency);
 
     // Process results as they complete
+    let mut new_results = Vec::with_capacity(domains.len());
     while let Some(domain_result) = stream.next().await {
         // Update statistics
         match domain_result.available {
@@ -616,13 +817,18 @@ async fn run_streaming_check(
         if args.score {
             ui::print_investment_score(&score_domain(&domain_result.domain));
         }
+        new_results.push(domain_result.clone());
         results.push(domain_result);
+    }
+
+    if let Some(store) = history_store {
+        store.append_results(&new_results)?;
     }
 
     let duration = start_time.elapsed();
 
     // Show final summary for multiple domains
-    if domains.len() > 1 && !args.json && !args.csv {
+    if total > 1 && !args.json && !args.csv {
         println!();
         ui::print_summary(
             results.len(),
@@ -632,6 +838,7 @@ async fn run_streaming_check(
             duration,
         );
     }
+    print_history_stats(history_stats, args.json || args.csv);
 
     Ok(())
 }
@@ -640,7 +847,11 @@ async fn run_streaming_check(
 async fn run_batch_check(
     checker: &DomainChecker,
     domains: &[String],
+    cached_results: Vec<DomainResult>,
+    requested_domains: &[String],
     args: &Args,
+    history_store: Option<&mut history::HistoryStore>,
+    history_stats: HistoryStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_structured = args.json || args.csv;
 
@@ -670,7 +881,15 @@ async fn run_batch_check(
     let start_time = std::time::Instant::now();
 
     // Check all domains (concurrent under the hood)
-    let results = checker.check_domains(domains).await?;
+    let new_results = if domains.is_empty() {
+        Vec::new()
+    } else {
+        checker.check_domains(domains).await?
+    };
+    if let Some(store) = history_store {
+        store.append_results(&new_results)?;
+    }
+    let results = order_results(requested_domains, cached_results, new_results);
 
     let duration = start_time.elapsed();
 
@@ -681,8 +900,25 @@ async fn run_batch_check(
 
     // Display results based on format
     display_results(&results, args, duration)?;
+    print_history_stats(history_stats, is_structured);
 
     Ok(())
+}
+
+fn order_results(
+    requested_domains: &[String],
+    cached: Vec<DomainResult>,
+    fresh: Vec<DomainResult>,
+) -> Vec<DomainResult> {
+    let mut by_domain = cached
+        .into_iter()
+        .chain(fresh)
+        .map(|result| (history::normalize_domain(&result.domain), result))
+        .collect::<std::collections::HashMap<_, _>>();
+    requested_domains
+        .iter()
+        .filter_map(|domain| by_domain.remove(&history::normalize_domain(domain)))
+        .collect()
 }
 
 /// Build CheckConfig from CLI arguments with config file integration.
@@ -1138,11 +1374,20 @@ async fn read_domains_from_file(
     Ok(domains)
 }
 
+struct GeneratedCandidates {
+    candidates: Option<Vec<ScoredCandidate>>,
+    history_skipped: usize,
+}
+
 fn generated_candidates_from_args(
     args: &Args,
-) -> Result<Option<Vec<ScoredCandidate>>, Box<dyn std::error::Error>> {
+    excluded_domains: std::collections::HashSet<String>,
+) -> Result<GeneratedCandidates, Box<dyn std::error::Error>> {
     let Some(count) = args.generate_count else {
-        return Ok(None);
+        return Ok(GeneratedCandidates {
+            candidates: None,
+            history_skipped: 0,
+        });
     };
     let raw_tld = args
         .tlds
@@ -1154,13 +1399,30 @@ fn generated_candidates_from_args(
         .ok_or_else(|| format!("Invalid TLD for candidate generation: {raw_tld}"))?;
     let top = args.top.unwrap_or(count);
     let (min_length, max_length) = generation_length_bounds(args);
-    let candidates = generate_premium_candidates(&CandidateGenerationConfig {
-        count,
-        top,
-        tld,
-        min_length,
-        max_length,
-    });
+    let (candidates, history_skipped) = generate_premium_candidates_with_filters_and_stats(
+        &CandidateGenerationConfig {
+            count,
+            top,
+            tld,
+            min_length,
+            max_length,
+        },
+        &CandidateGenerationFilters {
+            contains: args
+                .contains
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+            starts_with: args
+                .starts_with
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+            ends_with: args
+                .ends_with
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+            excluded_domains,
+        },
+    );
     if candidates.len() != top {
         let length_requirement = if min_length == max_length {
             format!(" with a {min_length}-character label")
@@ -1175,7 +1437,10 @@ fn generated_candidates_from_args(
         )
         .into());
     }
-    Ok(Some(candidates))
+    Ok(GeneratedCandidates {
+        candidates: Some(candidates),
+        history_skipped,
+    })
 }
 
 fn display_score_only(
@@ -1397,7 +1662,7 @@ mod tests {
     use super::*;
 
     // Helper function with all required fields
-    fn create_test_args() -> Args {
+    pub(crate) fn create_test_args() -> Args {
         Args {
             domains: vec![], // Empty domains for testing
             tlds: None,
@@ -1428,7 +1693,14 @@ mod tests {
             length: None,
             min_length: None,
             max_length: None,
+            contains: None,
+            starts_with: None,
+            ends_with: None,
             score_only: false,
+            no_history: false,
+            history_file: None,
+            clear_history: false,
+            interactive: false,
             yes: false,
             help: false,
         }

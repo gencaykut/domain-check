@@ -32,3 +32,6 @@ coverage-report/
 available-candidates.csv
 domain-results.csv
 domains.txt
+
+# Project-local persistent query history
+.domain-check-history.jsonl

@@ -65,6 +65,12 @@ domain-check --generate 500000 --top 5000 --length 5 -t com --score-only --csv >
 # Generate labels in an inclusive length range
 domain-check --generate 100000 --top 1000 --min-length 6 --max-length 8 -t com --score-only
 
+# Require letters in the second-level label
+domain-check --generate 500000 --top 500 --length 5 --contains ai -t com --score --csv
+
+# Start the interactive candidate wizard (also opens when run without args in a terminal)
+domain-check --interactive
+
 # Add prefixes and suffixes
 domain-check myapp --prefix get,try --suffix hub,ly -t com,io
 
@@ -80,6 +86,15 @@ count the second-level label, not the TLD (`abcde.com` has length 5). Premium ge
 labels from 5 through 10 characters. `--generate` controls the raw candidate-pool target while
 `--top` controls the number returned; if the requested top count cannot be filled, the command
 fails instead of silently returning a shorter list.
+
+`--contains`, `--starts-with`, and `--ends-with` constrain only the generated second-level label.
+They can be combined, and generation remains deterministic for identical inputs.
+
+Network checks use a project-local `.domain-check-history.jsonl` file by default. Previously seen
+`AVAILABLE` and `TAKEN` results are reused without another request; `UNKNOWN` results are retried
+after 24 hours. Use `--no-history` to bypass it, `--history-file <PATH>` to choose another JSONL
+file, or `--clear-history` to reset it. Generated network scans omit historical domains and fill
+their requested `--top` count with new candidates. The history file is ignored by Git.
 
 Pretty output:
 

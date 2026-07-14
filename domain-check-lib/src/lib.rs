@@ -48,8 +48,9 @@ pub mod scoring;
 // Re-export generation types for convenience
 pub use generate::{apply_affixes, estimate_pattern_count, expand_pattern, generate_names};
 pub use generator::{
-    generate_premium_candidates, normalize_tld, CandidateGenerationConfig, GenerationQualityScore,
-    ScoredCandidate,
+    generate_premium_candidates, generate_premium_candidates_with_filters,
+    generate_premium_candidates_with_filters_and_stats, normalize_tld, CandidateGenerationConfig,
+    CandidateGenerationFilters, GenerationQualityScore, ScoredCandidate,
 };
 pub use scoring::{score_domain, InvestmentScore};
 pub use types::{GenerateConfig, GenerationResult};

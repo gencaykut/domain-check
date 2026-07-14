@@ -147,6 +147,15 @@ pub struct CandidateGenerationConfig {
     pub max_length: usize,
 }
 
+/// Optional second-level label filters for premium generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CandidateGenerationFilters {
+    pub contains: Option<String>,
+    pub starts_with: Option<String>,
+    pub ends_with: Option<String>,
+    pub excluded_domains: HashSet<String>,
+}
+
 /// A generated domain and its explainable local investment score.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoredCandidate {
@@ -190,16 +199,35 @@ pub fn normalize_tld(tld: &str) -> Option<String> {
 ///
 /// The fixed pattern order and index permutation make identical configurations reproducible.
 pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<ScoredCandidate> {
+    generate_premium_candidates_with_filters(config, &CandidateGenerationFilters::default())
+}
+
+/// Generate premium candidates while applying deterministic second-level label filters.
+pub fn generate_premium_candidates_with_filters(
+    config: &CandidateGenerationConfig,
+    filters: &CandidateGenerationFilters,
+) -> Vec<ScoredCandidate> {
+    generate_premium_candidates_with_filters_and_stats(config, filters).0
+}
+
+/// Generate filtered candidates and report how many otherwise valid names history excluded.
+pub fn generate_premium_candidates_with_filters_and_stats(
+    config: &CandidateGenerationConfig,
+    filters: &CandidateGenerationFilters,
+) -> (Vec<ScoredCandidate>, usize) {
     if config.count == 0
         || config.top == 0
         || config.min_length < 5
         || config.max_length > 10
         || config.min_length > config.max_length
     {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let Some(tld) = normalize_tld(&config.tld) else {
-        return Vec::new();
+        return (Vec::new(), 0);
+    };
+    let Some(filters) = normalize_filters(filters, config.max_length) else {
+        return (Vec::new(), 0);
     };
 
     let constrained = config.min_length != 5 || config.max_length != 10;
@@ -216,18 +244,19 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
         (config.min_length..=config.max_length).any(|length| (5..=10).contains(&length));
     let generation_families = patterns.len() + usize::from(include_syllables);
     if generation_families == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let mut candidates = Vec::with_capacity(config.count);
     let mut seen = HashSet::with_capacity(config.count);
     let mut sequence = 0usize;
+    let mut excluded_count = 0usize;
     let max_attempts = config.count.saturating_mul(30).max(100);
 
     while candidates.len() < config.count && sequence < max_attempts {
         let pattern_index = sequence % generation_families;
         let ordinal = sequence / generation_families;
-        let name = if pattern_index < patterns.len() {
+        let raw_name = if pattern_index < patterns.len() {
             let pattern = patterns[pattern_index];
             let space = pattern_space(pattern);
             // Odd constants spread adjacent requests across the pattern space without randomness.
@@ -237,8 +266,12 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
             render_syllables(ordinal)
         };
         sequence += 1;
+        let Some(name) = apply_filters(raw_name, &filters, sequence) else {
+            continue;
+        };
 
         if !(config.min_length..=config.max_length).contains(&name.len())
+            || !matches_filters(&name, &filters)
             || !is_premium_name(&name)
             || is_reserved_collision(&name)
             || !seen.insert(name.clone())
@@ -246,6 +279,10 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
             continue;
         }
         let domain = format!("{name}.{tld}");
+        if filters.excluded_domains.contains(&domain) {
+            excluded_count += 1;
+            continue;
+        }
         let scoring = score_domain(&domain);
         let generation_quality = generation_quality_score(&name);
         candidates.push(ScoredCandidate {
@@ -264,17 +301,119 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
             .then_with(|| right.scoring.total_score.cmp(&left.scoring.total_score))
             .then_with(|| left.domain.cmp(&right.domain))
     });
-    select_diverse(
-        candidates,
-        config.top.min(config.count),
-        generation_families,
+    (
+        select_diverse(
+            candidates,
+            config.top.min(config.count),
+            generation_families,
+            &filters,
+        ),
+        excluded_count,
     )
+}
+
+fn normalize_filters(
+    filters: &CandidateGenerationFilters,
+    max_length: usize,
+) -> Option<CandidateGenerationFilters> {
+    let normalize = |value: &Option<String>| -> Option<Option<String>> {
+        match value {
+            None => Some(None),
+            Some(value)
+                if !value.is_empty()
+                    && value.len() <= max_length
+                    && value.bytes().all(|byte| byte.is_ascii_alphabetic()) =>
+            {
+                Some(Some(value.to_ascii_lowercase()))
+            }
+            Some(_) => None,
+        }
+    };
+    Some(CandidateGenerationFilters {
+        contains: normalize(&filters.contains)?,
+        starts_with: normalize(&filters.starts_with)?,
+        ends_with: normalize(&filters.ends_with)?,
+        excluded_domains: filters
+            .excluded_domains
+            .iter()
+            .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase())
+            .collect(),
+    })
+}
+
+fn apply_filters(
+    name: String,
+    filters: &CandidateGenerationFilters,
+    sequence: usize,
+) -> Option<String> {
+    if filters.contains.is_none() && filters.starts_with.is_none() && filters.ends_with.is_none() {
+        return Some(name);
+    }
+    let mut bytes = name.into_bytes();
+    if let Some(prefix) = &filters.starts_with {
+        bytes
+            .get_mut(..prefix.len())?
+            .copy_from_slice(prefix.as_bytes());
+    }
+    if let Some(suffix) = &filters.ends_with {
+        let start = bytes.len().checked_sub(suffix.len())?;
+        for (offset, byte) in suffix.bytes().enumerate() {
+            let index = start + offset;
+            if filters
+                .starts_with
+                .as_ref()
+                .is_some_and(|prefix| index < prefix.len() && bytes[index] != byte)
+            {
+                return None;
+            }
+            bytes[index] = byte;
+        }
+    }
+    if let Some(required) = &filters.contains {
+        let current = std::str::from_utf8(&bytes).ok()?;
+        if !current.contains(required) {
+            let max_start = bytes.len().checked_sub(required.len())?;
+            let starts = (0..=max_start)
+                .cycle()
+                .skip(sequence % (max_start + 1))
+                .take(max_start + 1);
+            let mut replacement = None;
+            for start in starts {
+                let mut candidate = bytes.clone();
+                candidate[start..start + required.len()].copy_from_slice(required.as_bytes());
+                let candidate_text = std::str::from_utf8(&candidate).ok()?;
+                if matches_filters(candidate_text, filters) {
+                    replacement = Some(candidate);
+                    break;
+                }
+            }
+            bytes = replacement?;
+        }
+    }
+    let value = String::from_utf8(bytes).ok()?;
+    matches_filters(&value, filters).then_some(value)
+}
+
+fn matches_filters(name: &str, filters: &CandidateGenerationFilters) -> bool {
+    filters
+        .contains
+        .as_ref()
+        .is_none_or(|value| name.contains(value))
+        && filters
+            .starts_with
+            .as_ref()
+            .is_none_or(|value| name.starts_with(value))
+        && filters
+            .ends_with
+            .as_ref()
+            .is_none_or(|value| name.ends_with(value))
 }
 
 fn select_diverse(
     candidates: Vec<ScoredCandidate>,
     top: usize,
     generation_families: usize,
+    filters: &CandidateGenerationFilters,
 ) -> Vec<ScoredCandidate> {
     let per_pattern_limit = top.div_ceil(generation_families).max(1);
     let mut selected = Vec::with_capacity(top);
@@ -285,7 +424,11 @@ fn select_diverse(
     let mut suffix_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut initial_counts: HashMap<u8, usize> = HashMap::new();
     let affix_limit = top.div_ceil(100).clamp(2, 10);
-    let initial_limit = top.div_ceil(15).max(2);
+    let initial_limit = if filters.starts_with.is_some() {
+        top
+    } else {
+        top.div_ceil(15).max(2)
+    };
 
     for candidate in &candidates {
         let family = family_signature(&candidate.domain);
@@ -815,5 +958,73 @@ mod tests {
         invalid.min_length = 11;
         invalid.max_length = 5;
         assert!(generate_premium_candidates(&invalid).is_empty());
+    }
+
+    #[test]
+    fn label_filters_apply_to_second_level_domain() {
+        let config = config(30_000, 50, "com");
+        let contains = generate_premium_candidates_with_filters(
+            &config,
+            &CandidateGenerationFilters {
+                contains: Some("ar".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(contains.len(), 50);
+        assert!(contains.iter().all(|candidate| candidate
+            .domain
+            .split('.')
+            .next()
+            .unwrap()
+            .contains("ar")));
+
+        let starts = generate_premium_candidates_with_filters(
+            &config,
+            &CandidateGenerationFilters {
+                starts_with: Some("la".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(starts
+            .iter()
+            .all(|candidate| candidate.domain.starts_with("la")));
+
+        let ends = generate_premium_candidates_with_filters(
+            &config,
+            &CandidateGenerationFilters {
+                ends_with: Some("ra".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(ends.iter().all(|candidate| candidate
+            .domain
+            .split('.')
+            .next()
+            .unwrap()
+            .ends_with("ra")));
+    }
+
+    #[test]
+    fn historical_domains_are_excluded_and_replaced_deterministically() {
+        let config = config(5_000, 20, "com");
+        let baseline = generate_premium_candidates(&config);
+        let excluded_domains = baseline
+            .iter()
+            .take(5)
+            .map(|candidate| candidate.domain.clone())
+            .collect();
+        let filters = CandidateGenerationFilters {
+            excluded_domains,
+            ..Default::default()
+        };
+        let (first, skipped) =
+            generate_premium_candidates_with_filters_and_stats(&config, &filters);
+        let second = generate_premium_candidates_with_filters(&config, &filters);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 20);
+        assert!(skipped >= 5);
+        assert!(first
+            .iter()
+            .all(|candidate| !filters.excluded_domains.contains(&candidate.domain)));
     }
 }
