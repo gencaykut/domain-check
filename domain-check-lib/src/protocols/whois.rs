@@ -9,6 +9,8 @@ use crate::types::{CheckMethod, DomainResult};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
+const MAX_REFERRAL_HOPS: usize = 1;
+
 /// WHOIS client for checking domain availability using the system's whois command.
 ///
 /// This client uses the system's `whois` command-line tool to query domain information.
@@ -119,41 +121,8 @@ impl WhoisClient {
 
     /// Execute the system whois command and parse the result.
     async fn execute_whois_command(&self, domain: &str) -> Result<bool, DomainCheckError> {
-        // First attempt
-        let output = Command::new("whois")
-            .arg(domain)
-            .output()
-            .await
-            .map_err(|e| {
-                DomainCheckError::whois(
-                    domain,
-                    format!(
-                        "Failed to execute whois command: {}. Make sure 'whois' is installed.",
-                        e
-                    ),
-                )
-            })?;
-
-        let output_text = String::from_utf8_lossy(&output.stdout).to_lowercase();
-
-        // Check for rate limiting first
-        if self.is_rate_limited(&output_text) {
-            // Wait and retry once
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-
-            let retry_output = Command::new("whois")
-                .arg(domain)
-                .output()
-                .await
-                .map_err(|e| {
-                    DomainCheckError::whois(domain, format!("Failed to execute whois retry: {}", e))
-                })?;
-
-            let retry_text = String::from_utf8_lossy(&retry_output.stdout).to_lowercase();
-            self.parse_whois_availability(&retry_text)
-        } else {
-            self.parse_whois_availability(&output_text)
-        }
+        let output = self.query_whois(domain, None).await?;
+        self.parse_with_referral(domain, &output, None).await
     }
 
     /// Execute whois command with a specific server (-h flag).
@@ -162,39 +131,67 @@ impl WhoisClient {
         domain: &str,
         server: &str,
     ) -> Result<bool, DomainCheckError> {
-        let output = Command::new("whois")
-            .arg("-h")
-            .arg(server)
-            .arg(domain)
-            .output()
+        let output = self.query_whois(domain, Some(server)).await?;
+        self.parse_with_referral(domain, &output, Some(server))
             .await
-            .map_err(|e| {
-                DomainCheckError::whois(
-                    domain,
-                    format!("Failed to execute whois -h {} command: {}", server, e),
-                )
-            })?;
+    }
 
-        let output_text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    /// Query WHOIS, retrying once when the response is rate limited.
+    async fn query_whois(
+        &self,
+        domain: &str,
+        server: Option<&str>,
+    ) -> Result<String, DomainCheckError> {
+        let output = self.run_whois_command(domain, server).await?;
 
-        if self.is_rate_limited(&output_text) {
+        if self.is_rate_limited(&output) {
             tokio::time::sleep(Duration::from_millis(1000)).await;
-
-            let retry_output = Command::new("whois")
-                .arg("-h")
-                .arg(server)
-                .arg(domain)
-                .output()
-                .await
-                .map_err(|e| {
-                    DomainCheckError::whois(domain, format!("Failed to execute whois retry: {}", e))
-                })?;
-
-            let retry_text = String::from_utf8_lossy(&retry_output.stdout).to_lowercase();
-            self.parse_whois_availability(&retry_text)
+            self.run_whois_command(domain, server).await
         } else {
-            self.parse_whois_availability(&output_text)
+            Ok(output)
         }
+    }
+
+    async fn run_whois_command(
+        &self,
+        domain: &str,
+        server: Option<&str>,
+    ) -> Result<String, DomainCheckError> {
+        let mut command = Command::new("whois");
+        if let Some(server) = server {
+            command.arg("-h").arg(server);
+        }
+
+        let output = command.arg(domain).output().await.map_err(|e| {
+            let target = server
+                .map(|server| format!(" via {server}"))
+                .unwrap_or_default();
+            DomainCheckError::whois(
+                domain,
+                format!(
+                    "Failed to execute whois command{target}: {e}. Make sure 'whois' is installed."
+                ),
+            )
+        })?;
+
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Follow at most one authoritative referral, then use the existing parser.
+    async fn parse_with_referral(
+        &self,
+        domain: &str,
+        output: &str,
+        queried_server: Option<&str>,
+    ) -> Result<bool, DomainCheckError> {
+        if let Some(referral) =
+            referral_server_for_follow_up(output, queried_server, MAX_REFERRAL_HOPS)
+        {
+            let referred_output = self.query_whois(domain, Some(&referral)).await?;
+            return self.parse_whois_availability(&referred_output);
+        }
+
+        self.parse_whois_availability(output)
     }
 
     /// Parse WHOIS output to determine domain availability.
@@ -234,6 +231,7 @@ impl WhoisClient {
             "no entries found",
             "domain not found",
             "domain available",
+            " is available for registration",
             "status: available",
             "status: free",
             "no information available",
@@ -377,25 +375,59 @@ pub async fn discover_whois_server(tld: &str) -> Option<String> {
 /// refer:        whois.verisign-grs.com
 /// ```
 fn parse_iana_refer_response(response: &str) -> Option<String> {
+    extract_referral_server(response)
+}
+
+/// Extract an authoritative WHOIS hostname from a response.
+///
+/// `refer:` takes precedence over `whois:`. Only simple hostnames are accepted,
+/// because the value is passed as an argument to the system WHOIS command.
+fn extract_referral_server(response: &str) -> Option<String> {
     let mut whois_server = None;
 
     for line in response.lines() {
         let line_trimmed = line.trim();
-        if let Some(server) = line_trimmed.strip_prefix("refer:") {
+        let line_lower = line_trimmed.to_ascii_lowercase();
+        if let Some(server) = line_lower.strip_prefix("refer:") {
             let server = server.trim();
-            if !server.is_empty() {
+            if is_valid_whois_server(server) {
                 // `refer:` is the canonical field — return immediately
                 return Some(server.to_string());
             }
-        } else if let Some(server) = line_trimmed.strip_prefix("whois:") {
+        } else if let Some(server) = line_lower.strip_prefix("whois:") {
             let server = server.trim();
-            if !server.is_empty() {
+            if is_valid_whois_server(server) {
                 whois_server = Some(server.to_string());
             }
         }
     }
 
     whois_server
+}
+
+fn referral_server_for_follow_up(
+    response: &str,
+    queried_server: Option<&str>,
+    hops_remaining: usize,
+) -> Option<String> {
+    if hops_remaining == 0 {
+        return None;
+    }
+
+    let referral = extract_referral_server(response)?;
+    if queried_server.is_some_and(|server| server.eq_ignore_ascii_case(&referral)) {
+        return None;
+    }
+
+    Some(referral)
+}
+
+fn is_valid_whois_server(server: &str) -> bool {
+    !server.is_empty()
+        && server.contains('.')
+        && server
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
 }
 
 /// Check if the system has a working whois command.
@@ -504,6 +536,14 @@ mod tests {
         let client = WhoisClient::new();
         assert!(client
             .parse_whois_availability("Domain available for registration")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_available_radix_registration_phrase() {
+        let client = WhoisClient::new();
+        assert!(client
+            .parse_whois_availability(">>> Domain cladine.tech is available for registration\n")
             .unwrap());
     }
 
@@ -711,6 +751,44 @@ mod tests {
     #[test]
     fn test_iana_empty_response() {
         assert_eq!(parse_iana_refer_response(""), None);
+    }
+
+    // ── referral follow-up guards ──────────────────────────────────────
+
+    #[test]
+    fn test_extract_referral_server_from_domain_response() {
+        let response = "% IANA WHOIS server\nrefer: whois.nic.tech\nwhois: whois.backup.test\n";
+        assert_eq!(
+            extract_referral_server(response),
+            Some("whois.nic.tech".to_string())
+        );
+    }
+
+    #[test]
+    fn test_referral_follow_up_none_without_referral() {
+        let response = "Domain Status: clientTransferProhibited\nRegistrar: Example Registrar\n";
+        assert_eq!(referral_server_for_follow_up(response, None, 1), None);
+    }
+
+    #[test]
+    fn test_referral_follow_up_rejects_duplicate_server() {
+        let response = "refer: whois.nic.tech\n";
+        assert_eq!(
+            referral_server_for_follow_up(response, Some("WHOIS.NIC.TECH"), 1),
+            None
+        );
+    }
+
+    #[test]
+    fn test_referral_follow_up_stops_after_one_hop() {
+        let response = "refer: whois.second.example\n";
+        assert_eq!(referral_server_for_follow_up(response, None, 0), None);
+    }
+
+    #[test]
+    fn test_referral_follow_up_rejects_invalid_server_value() {
+        let response = "refer: whois.example.test --unexpected-option\n";
+        assert_eq!(referral_server_for_follow_up(response, None, 1), None);
     }
 
     // ── Network-dependent test ──────────────────────────────────────────
