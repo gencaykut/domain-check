@@ -123,13 +123,13 @@ pub fn score_domain(domain: &str) -> InvestmentScore {
     const SUFFIXES: &[&str] = &[
         "ai", "app", "base", "fy", "hub", "io", "labs", "ly", "tech", "wise",
     ];
-    if PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
-        commercial_score += 4;
-        add_reason(&mut reasons, "commercial prefix");
-    }
-    if SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
-        commercial_score += 4;
-        add_reason(&mut reasons, "commercial suffix");
+    let has_commercial_prefix = PREFIXES.iter().any(|prefix| name.starts_with(prefix));
+    let has_commercial_suffix = SUFFIXES.iter().any(|suffix| name.ends_with(suffix));
+    // Affixes are weak supporting signals, not evidence of commercial value by themselves.
+    // Cap the combined benefit so a coincidental get/go/hub/base match cannot dominate a score.
+    if has_commercial_prefix || has_commercial_suffix {
+        commercial_score += 2;
+        add_reason(&mut reasons, "limited commercial affix signal");
     }
     commercial_score = commercial_score.min(25);
 
@@ -316,5 +316,19 @@ mod tests {
                 .iter()
                 .any(|reason| reason == expected_reason));
         }
+    }
+
+    #[test]
+    fn commercial_affix_signal_is_capped() {
+        let plain = score_domain("nuvora.com");
+        let prefix = score_domain("getora.com");
+        let prefix_and_suffix = score_domain("gethub.com");
+
+        assert!(prefix.commercial_score <= plain.commercial_score + 2);
+        assert!(prefix_and_suffix.commercial_score <= plain.commercial_score + 2);
+        assert!(prefix_and_suffix
+            .reasons
+            .iter()
+            .any(|reason| reason == "limited commercial affix signal"));
     }
 }
