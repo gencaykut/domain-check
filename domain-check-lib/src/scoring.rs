@@ -105,10 +105,10 @@ pub fn score_domain(domain: &str) -> InvestmentScore {
     }
     let spelling_score = spelling_score.clamp(0, 25) as u8;
 
-    let mut commercial_score = 0u8;
-    if tld == "com" {
-        commercial_score += 10;
-        add_reason(&mut reasons, ".com bonus");
+    let (tld_score, tld_reason) = tld_investment_weight(tld);
+    let mut commercial_score = tld_score;
+    if let Some(reason) = tld_reason {
+        add_reason(&mut reasons, reason);
     }
     if (5..=10).contains(&length)
         && pronounceability_score >= 18
@@ -182,6 +182,18 @@ pub fn score_domain(domain: &str) -> InvestmentScore {
 
 fn is_vowel(c: char) -> bool {
     matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u' | 'y')
+}
+
+fn tld_investment_weight(tld: &str) -> (u8, Option<&'static str>) {
+    match tld {
+        "com" => (10, Some(".com highest TLD premium")),
+        "ai" => (8, Some(".ai strong TLD premium")),
+        "io" => (7, Some(".io strong TLD premium")),
+        "app" | "dev" | "co" | "tech" => (5, Some("established TLD premium")),
+        "org" | "net" => (3, Some("moderate TLD premium")),
+        "xyz" | "me" => (1, Some("limited TLD premium")),
+        _ => (0, None),
+    }
 }
 
 fn longest_consonant_cluster(name: &str) -> usize {
@@ -261,5 +273,48 @@ mod tests {
     fn uppercase_and_subdomain_are_normalized() {
         assert_eq!(score_domain("CLADINE.COM"), score_domain("cladine.com"));
         assert_eq!(score_domain("www.cladine.com"), score_domain("cladine.com"));
+    }
+
+    #[test]
+    fn popular_tlds_follow_investment_priority() {
+        let com = score_domain("cladine.com");
+        let ai = score_domain("cladine.ai");
+        let io = score_domain("cladine.io");
+        let app = score_domain("cladine.app");
+        let dev = score_domain("cladine.dev");
+        let co = score_domain("cladine.co");
+        let org = score_domain("cladine.org");
+        let net = score_domain("cladine.net");
+        let xyz = score_domain("cladine.xyz");
+        let me = score_domain("cladine.me");
+
+        assert!(com.total_score > ai.total_score);
+        assert!(ai.total_score > io.total_score);
+        assert!(io.total_score > app.total_score);
+        assert_eq!(app.total_score, dev.total_score);
+        assert_eq!(dev.total_score, co.total_score);
+        assert!(co.total_score > org.total_score);
+        assert_eq!(org.total_score, net.total_score);
+        assert!(net.total_score > xyz.total_score);
+        assert_eq!(xyz.total_score, me.total_score);
+    }
+
+    #[test]
+    fn popular_tld_reasons_explain_the_investment_effect() {
+        let cases = [
+            ("cladine.com", ".com highest TLD premium"),
+            ("cladine.ai", ".ai strong TLD premium"),
+            ("cladine.io", ".io strong TLD premium"),
+            ("cladine.app", "established TLD premium"),
+            ("cladine.org", "moderate TLD premium"),
+            ("cladine.xyz", "limited TLD premium"),
+        ];
+
+        for (domain, expected_reason) in cases {
+            assert!(score_domain(domain)
+                .reasons
+                .iter()
+                .any(|reason| reason == expected_reason));
+        }
     }
 }
