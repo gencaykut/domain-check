@@ -27,3 +27,8 @@ assets/.demo-scenario.sh
 
 # Coverage reports
 coverage-report/
+
+# Local domain scan outputs
+available-candidates.csv
+domain-results.csv
+domains.txt
