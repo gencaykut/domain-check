@@ -12,7 +12,7 @@ use domain_check_lib::{
     initialize_bootstrap,
 };
 use domain_check_lib::{load_env_config, ConfigManager, FileConfig};
-use domain_check_lib::{CheckConfig, DomainChecker};
+use domain_check_lib::{score_domain, CheckConfig, DomainChecker, DomainResult};
 use std::io::BufRead;
 use std::process;
 
@@ -98,6 +98,10 @@ pub struct Args {
     /// Output results in CSV format
     #[arg(long = "csv", help_heading = "Output Format")]
     pub csv: bool,
+
+    /// Add a deterministic 0-100 domain investment score
+    #[arg(long = "score", help_heading = "Output Format")]
+    pub score: bool,
 
     /// Enable grouped, structured output with section headers
     #[arg(short = 'p', long = "pretty", help_heading = "Output Format")]
@@ -486,6 +490,9 @@ async fn run_streaming_check(
             ui::print_result(&domain_result, args.info, args.debug, counter);
         } else {
             ui::print_result_default(&domain_result, args.info, args.debug, counter);
+        }
+        if args.score {
+            ui::print_investment_score(&score_domain(&domain_result.domain));
         }
         results.push(domain_result);
     }
@@ -1015,9 +1022,9 @@ fn display_results(
     duration: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if args.json {
-        display_json_results(results)?;
+        display_json_results(results, args.score)?;
     } else if args.csv {
-        display_csv_results(results)?;
+        display_csv_results(results, args.score)?;
     } else {
         display_text_results(results, args, duration)?;
     }
@@ -1028,17 +1035,50 @@ fn display_results(
 /// Display results in JSON format
 fn display_json_results(
     results: &[domain_check_lib::DomainResult],
+    include_score: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(results)?;
+    let json = if include_score {
+        serde_json::to_string_pretty(&scored_json_value(results)?)?
+    } else {
+        serde_json::to_string_pretty(results)?
+    };
     println!("{}", json);
     Ok(())
+}
+
+fn scored_json_value(results: &[DomainResult]) -> Result<serde_json::Value, serde_json::Error> {
+    let values = results
+        .iter()
+        .map(|result| {
+            let mut value = serde_json::to_value(result)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "scoring".to_string(),
+                    serde_json::to_value(score_domain(&result.domain))?,
+                );
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+    Ok(serde_json::Value::Array(values))
 }
 
 /// Display results in CSV format
 fn display_csv_results(
     results: &[domain_check_lib::DomainResult],
+    include_score: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("domain,available,registrar,created,expires,method");
+    print!("{}", render_csv_results(results, include_score));
+    Ok(())
+}
+
+fn render_csv_results(results: &[DomainResult], include_score: bool) -> String {
+    let mut output = String::new();
+    if include_score {
+        output.push_str("domain,available,registrar,created,expires,method,investment_score,length_score,pronounceability_score,spelling_score,commercial_score,risk_penalty,reasons\n");
+    } else {
+        output.push_str("domain,available,registrar,created,expires,method\n");
+    }
 
     for result in results {
         let available = match result.available {
@@ -1065,13 +1105,42 @@ fn display_csv_results(
             .and_then(|i| i.expiration_date.as_deref())
             .unwrap_or("-");
 
-        println!(
+        let base = format!(
             "{},{},{},{},{},{}",
-            result.domain, available, registrar, created, expires, result.method_used
+            csv_escape(&result.domain),
+            available,
+            csv_escape(registrar),
+            csv_escape(created),
+            csv_escape(expires),
+            result.method_used
         );
+        output.push_str(&base);
+
+        if include_score {
+            let score = score_domain(&result.domain);
+            output.push_str(&format!(
+                ",{},{},{},{},{},{},{}",
+                score.total_score,
+                score.length_score,
+                score.pronounceability_score,
+                score.spelling_score,
+                score.commercial_score,
+                score.risk_penalty,
+                csv_escape(&score.reasons.join(" | "))
+            ));
+        }
+        output.push('\n');
     }
 
-    Ok(())
+    output
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 /// Display results in human-readable text format
@@ -1082,11 +1151,14 @@ fn display_text_results(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if args.pretty {
         // Pretty mode: grouped layout with section headers
-        ui::print_grouped_results(results, args.info, args.debug);
+        ui::print_grouped_results(results, args.info, args.debug, args.score);
     } else {
         // Default mode: colored flat list
         for result in results {
             ui::print_result_default(result, args.info, args.debug, None);
+            if args.score {
+                ui::print_investment_score(&score_domain(&result.domain));
+            }
         }
     }
 
@@ -1125,6 +1197,7 @@ mod tests {
             no_bootstrap: false,
             json: false,
             csv: false,
+            score: false,
             pretty: false,
             batch: false,
             streaming: false,
@@ -1316,5 +1389,54 @@ mod tests {
 
         let result = apply_cli_args_to_config(config, &args).unwrap();
         assert!(result.detailed_info, "--info should enable detailed info");
+    }
+
+    fn output_test_result(domain: &str) -> DomainResult {
+        DomainResult {
+            domain: domain.to_string(),
+            available: Some(true),
+            info: None,
+            check_duration: None,
+            method_used: domain_check_lib::CheckMethod::Rdap,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn test_csv_without_score_keeps_existing_schema() {
+        let csv = render_csv_results(&[output_test_result("cladine.com")], false);
+        assert_eq!(
+            csv,
+            "domain,available,registrar,created,expires,method\ncladine.com,true,-,-,-,RDAP\n"
+        );
+    }
+
+    #[test]
+    fn test_scored_csv_has_score_columns() {
+        let csv = render_csv_results(&[output_test_result("cladine.com")], true);
+        assert!(csv.contains("investment_score,length_score,pronounceability_score"));
+        assert!(csv.contains("cladine.com,true,-,-,-,RDAP,"));
+        assert!(csv.contains("balanced vowels"));
+    }
+
+    #[test]
+    fn test_scored_json_adds_scoring_object() {
+        let result = output_test_result("cladine.com");
+        let value = scored_json_value(&[result]).unwrap();
+        assert!(value[0]["scoring"]["total_score"].as_u64().unwrap() >= 80);
+        assert!(value[0]["scoring"]["reasons"].is_array());
+    }
+
+    #[test]
+    fn test_unscored_json_schema_remains_domain_result_schema() {
+        let result = output_test_result("cladine.com");
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(value.get("scoring").is_none());
+    }
+
+    #[test]
+    fn test_csv_escape_handles_quotes_and_commas() {
+        assert_eq!(csv_escape("one,two"), "\"one,two\"");
+        assert_eq!(csv_escape("a\"b"), "\"a\"\"b\"");
     }
 }

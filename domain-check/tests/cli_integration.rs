@@ -32,6 +32,16 @@ fn test_help_shows_new_flags() {
 }
 
 #[test]
+fn test_help_shows_score_flag() {
+    let mut cmd = Command::cargo_bin("domain-check").unwrap();
+    cmd.arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("--score"));
+}
+
+#[test]
 fn test_list_presets_output() {
     let mut cmd = Command::cargo_bin("domain-check").unwrap();
     cmd.arg("--list-presets");

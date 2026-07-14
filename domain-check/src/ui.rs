@@ -8,7 +8,7 @@
 //! Pretty mode: everything above plus grouped layout, column alignment, styled header.
 
 use console::{pad_str, style, Alignment, Term};
-use domain_check_lib::{DomainInfo, DomainResult};
+use domain_check_lib::{score_domain, DomainInfo, DomainResult, InvestmentScore};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,6 +111,7 @@ pub fn print_custom_help() {
     print_section("OUTPUT FORMAT");
     print_flag("-j", "--json", "Output results in JSON format");
     print_flag("", "--csv", "Output results in CSV format");
+    print_flag("", "--score", "Add a deterministic investment score");
     print_flag("-p", "--pretty", "Grouped output with section headers");
     print_flag("-i", "--info", "Show detailed domain information");
     print_flag("", "--batch", "Collect all results before displaying");
@@ -424,7 +425,12 @@ pub fn print_result_default(
 
 /// Print results grouped by status: Available, Taken, Unknown.
 /// Empty sections are omitted entirely.
-pub fn print_grouped_results(results: &[DomainResult], show_info: bool, debug: bool) {
+pub fn print_grouped_results(
+    results: &[DomainResult],
+    show_info: bool,
+    debug: bool,
+    show_score: bool,
+) {
     let mut available: Vec<&DomainResult> = Vec::new();
     let mut taken: Vec<&DomainResult> = Vec::new();
     let mut unknown: Vec<&DomainResult> = Vec::new();
@@ -447,6 +453,9 @@ pub fn print_grouped_results(results: &[DomainResult], show_info: bool, debug: b
         );
         for r in &available {
             print_grouped_line(r, show_info, debug);
+            if show_score {
+                print_investment_score(&score_domain(&r.domain));
+            }
         }
         println!();
     }
@@ -459,6 +468,9 @@ pub fn print_grouped_results(results: &[DomainResult], show_info: bool, debug: b
         );
         for r in &taken {
             print_grouped_line(r, show_info, debug);
+            if show_score {
+                print_investment_score(&score_domain(&r.domain));
+            }
         }
         println!();
     }
@@ -473,9 +485,22 @@ pub fn print_grouped_results(results: &[DomainResult], show_info: bool, debug: b
         );
         for r in &unknown {
             print_grouped_line(r, show_info, debug);
+            if show_score {
+                print_investment_score(&score_domain(&r.domain));
+            }
         }
         println!();
     }
+}
+
+/// Print the explainable score directly below a text result.
+pub fn print_investment_score(score: &InvestmentScore) {
+    println!(
+        "    {} {}  {}",
+        style("Investment score:").dim(),
+        style(format!("{}/100", score.total_score)).cyan().bold(),
+        style(score.reasons.join(" | ")).dim(),
+    );
 }
 
 /// Print a single line inside a grouped section.
