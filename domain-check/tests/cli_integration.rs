@@ -89,7 +89,7 @@ fn test_score_only_csv_schema() {
     cmd.assert()
         .success()
         .stdout(predicate::str::starts_with(
-            "domain,investment_score,length_score,pronounceability_score",
+            "domain,investment_score,generation_quality_score,phonotactic_score",
         ))
         .stdout(predicate::str::contains("reasons\n"));
 }
@@ -107,6 +107,7 @@ fn test_score_only_json_schema() {
     assert!(json[0]["domain"].as_str().unwrap().ends_with(".com"));
     assert!(json[0]["scoring"]["total_score"].is_number());
     assert!(json[0]["scoring"]["reasons"].is_array());
+    assert!(json[0]["generation_quality"]["total_score"].is_number());
 }
 
 #[test]

@@ -21,7 +21,7 @@ Quick Links: [Installation](#installation) | [Quick Start](#quick-start) | [Use 
 - **Dual-protocol engine** — RDAP-first with automatic WHOIS fallback. IANA server discovery covers ~189 ccTLDs that lack RDAP (`.es`, `.co`, `.eu`, `.jp`).
 - **Fast** — up to 100 concurrent checks, streaming results as they complete. 2.7 MB release binary.
 - **Domain generation** — pattern expansion (`\w`=letter, `\d`=digit, `?`=either), prefix/suffix permutations, and `--dry-run` to preview before checking.
-- **Premium candidate generation** — deterministic, offline phonetic generation with collision screening, English-like transition penalties, affix/family diversity quotas, and `--score-only` output.
+- **Premium candidate generation** — deterministic, offline phonetic generation with a separate n-gram-based `generation_quality` score, boundary/rhythm analysis, collision screening, and affix/family diversity quotas.
 - **11 curated presets** — `startup`, `tech`, `creative`, `finance`, `ecommerce`, and more. Or define your own in config.
 - **Rich output** — grouped pretty display, JSON, CSV. Registrar info, creation/expiration dates, and status codes with `--info`.
 - **CI and automation friendly** — `--json`/`--csv` to stdout, `--yes` to skip prompts, `--force` for large runs, automatic non-TTY detection.

@@ -4,13 +4,16 @@ use crate::{score_domain, InvestmentScore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-const CONSONANTS: &[u8] = b"bcdfghjklmnprstvwz";
+// Sonorants and other brand-friendly consonants are intentionally represented more often than
+// hard stops. The generator is still deterministic; this only changes which parts of the search
+// space receive more coverage in a finite run.
+const CONSONANTS: &[u8] = b"lrvsmnctpldrvnsgkfbhjwz";
 const VOWELS: &[u8] = b"aeiou";
 const PATTERNS: &[&str] = &["CVCVC", "CVCVCV", "CVCCVC", "CVCVCVC"];
 const SAFE_SYLLABLES: &[&str] = &[
-    "al", "ara", "avi", "bel", "bo", "ca", "dari", "do", "ela", "fa", "gali", "ha", "ivo", "ka",
-    "lari", "lo", "mari", "mi", "navi", "ne", "ora", "pa", "ravi", "re", "sani", "se", "tavi",
-    "te", "uma", "va", "vero", "vi", "za", "zen",
+    "al", "ara", "avi", "bel", "bo", "ca", "dari", "do", "ela", "eva", "ivo", "lari", "le", "lo",
+    "luma", "mari", "mi", "navi", "ne", "nora", "nova", "ora", "ravi", "re", "ria", "sani", "se",
+    "sol", "tavi", "te", "uma", "va", "vela", "vero", "vi", "via", "za", "zen",
 ];
 const GENERATION_FAMILIES: usize = PATTERNS.len() + 1;
 const NEGATIVE_PARTS: &[&str] = &[
@@ -118,8 +121,22 @@ pub struct CandidateGenerationConfig {
 pub struct ScoredCandidate {
     pub domain: String,
     pub scoring: InvestmentScore,
+    pub generation_quality: GenerationQualityScore,
     #[serde(skip)]
     pattern_index: usize,
+}
+
+/// Generator-specific linguistic quality. This deliberately does not alter `InvestmentScore` or
+/// the public `score_domain` API used for manually supplied domains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationQualityScore {
+    pub total_score: u8,
+    pub phonotactic_score: u8,
+    pub boundary_score: u8,
+    pub rhythm_score: u8,
+    pub naturalness_score: u8,
+    pub penalty: u8,
+    pub reasons: Vec<String>,
 }
 
 /// Normalize a single TLD (`.COM` -> `com`) and reject unsafe values.
@@ -172,10 +189,11 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
             continue;
         }
         let domain = format!("{name}.{tld}");
-        let mut scoring = score_domain(&domain);
-        apply_generation_quality(&name, &mut scoring);
+        let scoring = score_domain(&domain);
+        let generation_quality = generation_quality_score(&name);
         candidates.push(ScoredCandidate {
             scoring,
+            generation_quality,
             domain,
             pattern_index,
         });
@@ -183,9 +201,10 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
 
     candidates.sort_by(|left, right| {
         right
-            .scoring
+            .generation_quality
             .total_score
-            .cmp(&left.scoring.total_score)
+            .cmp(&left.generation_quality.total_score)
+            .then_with(|| right.scoring.total_score.cmp(&left.scoring.total_score))
             .then_with(|| left.domain.cmp(&right.domain))
     });
     select_diverse(candidates, config.top.min(config.count))
@@ -294,60 +313,171 @@ fn matched_suffix(name: &str) -> Option<&'static str> {
         .find(|suffix| name.ends_with(suffix))
 }
 
-fn apply_generation_quality(name: &str, score: &mut InvestmentScore) {
-    let unlikely_count = UNLIKELY_BIGRAMS
-        .iter()
-        .filter(|bigram| name.contains(**bigram))
-        .count();
-    let mut penalty = (unlikely_count.min(2) * 9) as u8;
+const FLUENT_BIGRAMS: &[&str] = &[
+    "al", "an", "ar", "av", "ca", "ce", "el", "en", "er", "ia", "io", "la", "le", "li", "lo", "lu",
+    "ma", "mi", "na", "ne", "ni", "no", "or", "ra", "re", "ri", "ro", "sa", "se", "si", "so", "ta",
+    "te", "ti", "va", "ve", "vi", "vo",
+];
+const FLUENT_TRIGRAMS: &[&str] = &[
+    "ala", "ali", "ara", "ari", "ava", "avi", "ela", "eli", "iva", "lar", "lia", "lin", "lum",
+    "mar", "nav", "nor", "nov", "ora", "ori", "rav", "ria", "rio", "sol", "val", "vel", "ver",
+    "via", "vio",
+];
+const NATURAL_ONSETS: &[&str] = &[
+    "al", "ar", "av", "el", "la", "le", "li", "lo", "lu", "ma", "mi", "na", "ne", "no", "ra", "re",
+    "ri", "ro", "sa", "se", "si", "so", "va", "ve", "vi",
+];
+const NATURAL_ENDINGS: &[&str] = &[
+    "a", "ia", "io", "na", "ne", "no", "ra", "re", "ria", "ro", "sa", "se", "ta", "va", "via", "vo",
+];
+const HARSH_ENDINGS: &[&str] = &[
+    "beg", "bep", "fif", "fok", "hut", "muc", "woc", "wok", "wug", "coc", "gub", "kug", "puc",
+    "tut", "eg", "ep", "if", "uc",
+];
+const SONORANTS: &[u8] = b"lrmnsvwy";
+const HARD_CONSONANTS: &[u8] = b"bdgjkptfch";
 
-    if unlikely_count > 0 {
-        add_generation_reason(score, "unlikely English letter transition");
+fn generation_quality_score(name: &str) -> GenerationQualityScore {
+    let bigrams: Vec<&str> = name
+        .char_indices()
+        .zip(name.char_indices().skip(2))
+        .map(|((start, _), (end, _))| &name[start..end])
+        .collect();
+    let trigrams: Vec<&str> = name
+        .char_indices()
+        .zip(name.char_indices().skip(3))
+        .map(|((start, _), (end, _))| &name[start..end])
+        .collect();
+    let fluent_bigrams = bigrams
+        .iter()
+        .filter(|part| FLUENT_BIGRAMS.contains(part))
+        .count();
+    let unlikely_bigrams = bigrams
+        .iter()
+        .filter(|part| UNLIKELY_BIGRAMS.contains(part))
+        .count();
+    let fluent_trigrams = trigrams
+        .iter()
+        .filter(|part| FLUENT_TRIGRAMS.contains(part))
+        .count();
+
+    let mut reasons = Vec::new();
+    let mut penalty = (unlikely_bigrams * 7).min(21) as i16;
+    let coverage = if bigrams.is_empty() {
+        0
+    } else {
+        (fluent_bigrams * 20 / bigrams.len()) as i16
+    };
+    let phonotactic_score = (6 + coverage + (fluent_trigrams.min(6) * 2) as i16
+        - (unlikely_bigrams * 5) as i16)
+        .clamp(0, 40) as u8;
+    if phonotactic_score >= 28 {
+        reasons.push("fluent n-gram profile".to_string());
+    } else if unlikely_bigrams > 0 {
+        reasons.push("unlikely letter transitions".to_string());
     }
-    if AWKWARD_ENDINGS.iter().any(|ending| name.ends_with(ending)) {
-        penalty = penalty.saturating_add(8);
-        add_generation_reason(score, "ambiguous ending");
+
+    let natural_onset = NATURAL_ONSETS.iter().any(|part| name.starts_with(part));
+    let natural_ending = NATURAL_ENDINGS.iter().any(|part| name.ends_with(part));
+    let harsh_ending = HARSH_ENDINGS.iter().any(|part| name.ends_with(part));
+    let mut boundary_score = 8i16;
+    if natural_onset {
+        boundary_score += 5;
+    }
+    if natural_ending {
+        boundary_score += 8;
+    }
+    if harsh_ending || AWKWARD_ENDINGS.iter().any(|ending| name.ends_with(ending)) {
+        boundary_score -= 8;
+        penalty += 10;
+        reasons.push("harsh or artificial ending".to_string());
+    } else if natural_onset && natural_ending {
+        reasons.push("natural brand boundaries".to_string());
+    }
+    let boundary_score = boundary_score.clamp(0, 20) as u8;
+
+    let letters = name.as_bytes();
+    let vowel_count = letters.iter().filter(|byte| VOWELS.contains(byte)).count();
+    let sonorant_count = letters
+        .iter()
+        .filter(|byte| SONORANTS.contains(byte))
+        .count();
+    let hard_count = letters
+        .iter()
+        .filter(|byte| HARD_CONSONANTS.contains(byte))
+        .count();
+    let vowel_ratio = vowel_count as f32 / letters.len().max(1) as f32;
+    let mut rhythm_score = if (0.32..=0.58).contains(&vowel_ratio) {
+        11i16
+    } else {
+        6
+    };
+    rhythm_score += (sonorant_count.min(4) * 2) as i16;
+    if hard_count >= 3 && hard_count > sonorant_count + 1 {
+        rhythm_score -= 7;
+        penalty += 8;
+        reasons.push("hard-stop dominated rhythm".to_string());
+    }
+    if has_artificial_cvc_loop(name) {
+        rhythm_score -= 6;
+        penalty += 9;
+        reasons.push("artificial CVC cadence".to_string());
+    }
+    let rhythm_score = rhythm_score.clamp(0, 20) as u8;
+
+    let mut naturalness_score = 12i16 + (fluent_trigrams.min(3) * 2) as i16;
+    if has_repeated_fragment(name) {
+        naturalness_score -= 15;
+        penalty += 20;
+        reasons.push("repeated syllable fragment".to_string());
     }
     if AWKWARD_VOWEL_TRANSITIONS
         .iter()
         .any(|transition| name.contains(transition))
+        || UNCOMMON_DOUBLE_CONSONANTS
+            .iter()
+            .any(|pair| name.contains(pair))
     {
-        penalty = penalty.saturating_add(8);
-        add_generation_reason(score, "awkward vowel transition");
+        naturalness_score -= 6;
+        penalty += 7;
+        reasons.push("low natural-language probability".to_string());
     }
-    if UNCOMMON_DOUBLE_CONSONANTS
-        .iter()
-        .any(|pair| name.contains(pair))
-    {
-        penalty = penalty.saturating_add(8);
-        add_generation_reason(score, "uncommon doubled consonant");
-    }
-
-    let weak_prefix_stem = matched_prefix(name)
-        .map(|prefix| &name[prefix.len()..])
-        .is_some_and(|stem| stem.len() < 3 || contains_unlikely_bigram(stem));
-    let weak_suffix_stem = matched_suffix(name)
-        .map(|suffix| &name[..name.len() - suffix.len()])
-        .is_some_and(|stem| stem.len() < 3 || contains_unlikely_bigram(stem));
-    if weak_prefix_stem || weak_suffix_stem {
-        penalty = penalty.saturating_add(18);
-        add_generation_reason(score, "weak or meaningless affix stem");
-    }
-
     if matched_prefix(name).is_some() || matched_suffix(name).is_some() {
-        // The general scorer exposes affixes as a small commercial signal. Generated candidates
-        // can match those strings by chance, so ranking neutralizes that bonus until a human has
-        // confirmed that the stem is meaningful.
-        penalty = penalty.saturating_add(2);
-        add_generation_reason(score, "generated affix requires semantic review");
+        naturalness_score -= 2;
+        reasons.push("generated affix requires semantic review".to_string());
     }
-    if has_repeated_fragment(name) {
-        penalty = penalty.saturating_add(14);
-        add_generation_reason(score, "repetitive or meaningless syllable pattern");
-    }
+    let naturalness_score = naturalness_score.clamp(0, 20) as u8;
+    let penalty = penalty.clamp(0, 50) as u8;
+    let total_score = (phonotactic_score as i16
+        + boundary_score as i16
+        + rhythm_score as i16
+        + naturalness_score as i16
+        - penalty as i16)
+        .clamp(0, 100) as u8;
 
-    score.risk_penalty = score.risk_penalty.saturating_add(penalty).min(50);
-    score.total_score = score.total_score.saturating_sub(penalty);
+    GenerationQualityScore {
+        total_score,
+        phonotactic_score,
+        boundary_score,
+        rhythm_score,
+        naturalness_score,
+        penalty,
+        reasons,
+    }
+}
+
+fn has_artificial_cvc_loop(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 5 {
+        return false;
+    }
+    let consonant_at = |index: usize| !VOWELS.contains(&bytes[index]);
+    let alternating = (0..bytes.len()).all(|index| consonant_at(index) == (index % 2 == 0));
+    let hard_onsets = (0..bytes.len())
+        .step_by(2)
+        .filter(|index| HARD_CONSONANTS.contains(&bytes[*index]))
+        .count();
+    alternating && hard_onsets >= 2
 }
 
 fn has_repeated_fragment(name: &str) -> bool {
@@ -359,16 +489,6 @@ fn has_repeated_fragment(name: &str) -> bool {
                 .any(|other| other == fragment)
         })
     })
-}
-
-fn contains_unlikely_bigram(name: &str) -> bool {
-    UNLIKELY_BIGRAMS.iter().any(|bigram| name.contains(*bigram))
-}
-
-fn add_generation_reason(score: &mut InvestmentScore, reason: &str) {
-    if !score.reasons.iter().any(|existing| existing == reason) {
-        score.reasons.push(reason.to_string());
-    }
 }
 
 fn pattern_space(pattern: &str) -> usize {
@@ -518,16 +638,17 @@ mod tests {
 
     #[test]
     fn awkward_generated_names_receive_quality_penalties() {
-        let score_for = |name: &str| {
-            let mut score = score_domain(&format!("{name}.com"));
-            apply_generation_quality(name, &mut score);
-            score
-        };
+        let score_for = generation_quality_score;
 
         assert!(score_for("gobdeh").total_score < score_for("cladine").total_score);
         assert!(score_for("getow").total_score < score_for("cladine").total_score);
         assert!(score_for("cikiw").total_score < score_for("cladine").total_score);
-        assert!(score_for("alalal").total_score < score_for("cladine").total_score);
+        assert!(
+            score_for("alalal").total_score < score_for("cladine").total_score,
+            "alalal={} cladine={}",
+            score_for("alalal").total_score,
+            score_for("cladine").total_score
+        );
         assert!(score_for("caalbo").total_score < score_for("cladine").total_score);
         assert!(score_for("babbeg").total_score < score_for("cladine").total_score);
         assert!(!is_premium_name("faphub"));
@@ -553,10 +674,45 @@ mod tests {
 
     #[test]
     fn quality_filter_preserves_clean_brandable_examples() {
-        let mut clean = score_domain("cladine.com");
-        let original = clean.clone();
-        apply_generation_quality("cladine", &mut clean);
-        assert_eq!(clean, original);
-        assert!(clean.total_score >= 85);
+        let clean = generation_quality_score("cladine");
+        assert!(clean.total_score >= 50, "cladine={clean:?}");
+    }
+
+    #[test]
+    fn fluent_examples_outrank_hard_synthetic_names() {
+        let fluent = ["alarado", "alarava", "elaboca"];
+        let weak = ["babeg", "dabep", "fabfif", "kabhut", "mabmuc", "nabfok"];
+        let lowest_fluent = fluent
+            .iter()
+            .map(|name| generation_quality_score(name).total_score)
+            .min()
+            .unwrap();
+        let highest_weak = weak
+            .iter()
+            .map(|name| generation_quality_score(name).total_score)
+            .max()
+            .unwrap();
+        assert!(
+            lowest_fluent > highest_weak,
+            "fluent floor {lowest_fluent} did not beat weak ceiling {highest_weak}"
+        );
+    }
+
+    #[test]
+    fn top_results_have_a_granular_quality_distribution() {
+        let candidates = generate_premium_candidates(&config(30_000, 50, "com"));
+        let distinct: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.generation_quality.total_score)
+            .collect();
+        assert!(
+            distinct.len() >= 5,
+            "only {} distinct scores",
+            distinct.len()
+        );
+        assert!(candidates
+            .windows(2)
+            .all(|pair| pair[0].generation_quality.total_score
+                >= pair[1].generation_quality.total_score));
     }
 }

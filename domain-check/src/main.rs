@@ -1125,10 +1125,12 @@ fn display_score_only(
     } else {
         for candidate in candidates {
             println!(
-                "{} {} {}",
+                "{} {} generation-quality={} {} | quality: {}",
                 candidate.domain,
                 candidate.scoring.total_score,
-                candidate.scoring.reasons.join(" | ")
+                candidate.generation_quality.total_score,
+                candidate.scoring.reasons.join(" | "),
+                candidate.generation_quality.reasons.join(" | ")
             );
         }
     }
@@ -1137,20 +1139,27 @@ fn display_score_only(
 
 fn render_score_only_csv(candidates: &[ScoredCandidate]) -> String {
     let mut output = String::from(
-        "domain,investment_score,length_score,pronounceability_score,spelling_score,commercial_score,risk_penalty,reasons\n",
+        "domain,investment_score,generation_quality_score,phonotactic_score,boundary_score,rhythm_score,naturalness_score,generation_penalty,length_score,pronounceability_score,spelling_score,commercial_score,risk_penalty,reasons,generation_reasons\n",
     );
     for candidate in candidates {
         let score = &candidate.scoring;
         output.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_escape(&candidate.domain),
             score.total_score,
+            candidate.generation_quality.total_score,
+            candidate.generation_quality.phonotactic_score,
+            candidate.generation_quality.boundary_score,
+            candidate.generation_quality.rhythm_score,
+            candidate.generation_quality.naturalness_score,
+            candidate.generation_quality.penalty,
             score.length_score,
             score.pronounceability_score,
             score.spelling_score,
             score.commercial_score,
             score.risk_penalty,
-            csv_escape(&score.reasons.join(" | "))
+            csv_escape(&score.reasons.join(" | ")),
+            csv_escape(&candidate.generation_quality.reasons.join(" | "))
         ));
     }
     output
@@ -1492,7 +1501,7 @@ mod tests {
             tld: "com".to_string(),
         });
         let csv = render_score_only_csv(&candidates);
-        assert!(csv.starts_with("domain,investment_score,length_score"));
+        assert!(csv.starts_with("domain,investment_score,generation_quality_score"));
         assert_eq!(csv.lines().count(), 3);
         assert!(!csv.contains("available"));
     }
