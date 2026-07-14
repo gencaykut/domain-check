@@ -59,6 +59,12 @@ domain-check --generate 30000 --top 1000 -t com --score-only
 # Export locally scored candidates as CSV
 domain-check --generate 30000 --top 1000 -t com --score-only --csv > premium-1000.csv
 
+# Generate exactly 5,000 five-letter labels (the TLD is not counted)
+domain-check --generate 500000 --top 5000 --length 5 -t com --score-only --csv > premium-5-letter.csv
+
+# Generate labels in an inclusive length range
+domain-check --generate 100000 --top 1000 --min-length 6 --max-length 8 -t com --score-only
+
 # Add prefixes and suffixes
 domain-check myapp --prefix get,try --suffix hub,ly -t com,io
 
@@ -68,6 +74,12 @@ domain-check target.com --info
 # Check every known TLD
 domain-check brand --all --batch
 ```
+
+`--length`, `--min-length`, and `--max-length` apply only to premium `--generate` mode and
+count the second-level label, not the TLD (`abcde.com` has length 5). Premium generation supports
+labels from 5 through 10 characters. `--generate` controls the raw candidate-pool target while
+`--top` controls the number returned; if the requested top count cannot be filled, the command
+fails instead of silently returning a shorter list.
 
 Pretty output:
 

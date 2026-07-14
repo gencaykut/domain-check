@@ -49,7 +49,123 @@ fn test_help_shows_premium_generation_flags() {
         .success()
         .stdout(predicate::str::contains("--generate <COUNT>"))
         .stdout(predicate::str::contains("--top <COUNT>"))
+        .stdout(predicate::str::contains("--length <N>"))
+        .stdout(predicate::str::contains("--min-length <N>"))
+        .stdout(predicate::str::contains("--max-length <N>"))
         .stdout(predicate::str::contains("--score-only"));
+}
+
+#[test]
+fn test_exact_generated_length_in_text_csv_and_json() {
+    for format in [None, Some("--csv"), Some("--json")] {
+        let mut args = vec![
+            "--generate",
+            "5000",
+            "--top",
+            "100",
+            "--length",
+            "5",
+            "--score-only",
+        ];
+        if let Some(format) = format {
+            args.push(format);
+        }
+        let output = Command::cargo_bin("domain-check")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        if format == Some("--json") {
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json.as_array().unwrap().len(), 100);
+            assert!(json.as_array().unwrap().iter().all(|candidate| {
+                candidate["domain"]
+                    .as_str()
+                    .unwrap()
+                    .split('.')
+                    .next()
+                    .unwrap()
+                    .len()
+                    == 5
+            }));
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            let lines = text.lines().skip(usize::from(format == Some("--csv")));
+            assert!(lines
+                .map(|line| line.split([',', ' ']).next().unwrap())
+                .all(|domain| domain.split('.').next().unwrap().len() == 5));
+        }
+    }
+}
+
+#[test]
+fn test_generated_length_range() {
+    let output = Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--generate",
+            "5000",
+            "--top",
+            "200",
+            "--min-length",
+            "6",
+            "--max-length",
+            "7",
+            "--score-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .all(|line| { (6..=7).contains(&line.split('.').next().unwrap().len()) }));
+}
+
+#[test]
+fn test_generated_length_conflicts_are_clear() {
+    let cases = [
+        (
+            vec!["--generate", "10", "--min-length", "8", "--max-length", "6"],
+            "greater",
+        ),
+        (
+            vec!["--generate", "10", "--length", "5", "--min-length", "5"],
+            "cannot be combined",
+        ),
+        (vec!["manual.com", "--length", "5"], "require --generate"),
+        (
+            vec!["--generate", "10", "--length", "4"],
+            "between 5 and 10",
+        ),
+    ];
+    for (args, message) in cases {
+        Command::cargo_bin("domain-check")
+            .unwrap()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(message));
+    }
+}
+
+#[test]
+fn test_requested_top_fails_when_length_pool_is_too_small() {
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--generate",
+            "10",
+            "--top",
+            "10",
+            "--length",
+            "5",
+            "--score-only",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Could only generate"));
 }
 
 #[test]

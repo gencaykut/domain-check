@@ -106,6 +106,26 @@ pub struct Args {
     #[arg(long = "top", value_name = "COUNT", help_heading = "Domain Generation")]
     pub top: Option<usize>,
 
+    /// Require an exact second-level label length for generated candidates
+    #[arg(long = "length", value_name = "N", help_heading = "Domain Generation")]
+    pub length: Option<usize>,
+
+    /// Minimum second-level label length for generated candidates
+    #[arg(
+        long = "min-length",
+        value_name = "N",
+        help_heading = "Domain Generation"
+    )]
+    pub min_length: Option<usize>,
+
+    /// Maximum second-level label length for generated candidates
+    #[arg(
+        long = "max-length",
+        value_name = "N",
+        help_heading = "Domain Generation"
+    )]
+    pub max_length: Option<usize>,
+
     /// Output generated candidates and scores without network checks
     #[arg(long = "score-only", help_heading = "Domain Generation")]
     pub score_only: bool,
@@ -267,8 +287,17 @@ fn validate_args(args: &Args) -> Result<(), String> {
                 return Err("--top COUNT must be between 1 and --generate COUNT".to_string());
             }
         }
-    } else if args.top.is_some() || args.score_only {
-        return Err("--top and --score-only require --generate".to_string());
+        validate_generation_lengths(args)?;
+    } else if args.top.is_some()
+        || args.score_only
+        || args.length.is_some()
+        || args.min_length.is_some()
+        || args.max_length.is_some()
+    {
+        return Err(
+            "--top, --score-only, --length, --min-length, and --max-length require --generate"
+                .to_string(),
+        );
     }
 
     if args.score_only && args.dry_run {
@@ -313,6 +342,28 @@ fn validate_args(args: &Args) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn validate_generation_lengths(args: &Args) -> Result<(), String> {
+    if args.length.is_some() && (args.min_length.is_some() || args.max_length.is_some()) {
+        return Err("--length cannot be combined with --min-length or --max-length".to_string());
+    }
+    let (min_length, max_length) = generation_length_bounds(args);
+    if !(5..=10).contains(&min_length) || !(5..=10).contains(&max_length) {
+        return Err("Generated label lengths must be between 5 and 10".to_string());
+    }
+    if min_length > max_length {
+        return Err("--min-length cannot be greater than --max-length".to_string());
+    }
+    Ok(())
+}
+
+fn generation_length_bounds(args: &Args) -> (usize, usize) {
+    if let Some(length) = args.length {
+        (length, length)
+    } else {
+        (args.min_length.unwrap_or(5), args.max_length.unwrap_or(10))
+    }
 }
 
 /// Print all available TLD presets with their TLDs, then exit.
@@ -1102,11 +1153,24 @@ fn generated_candidates_from_args(
     let tld = normalize_tld(raw_tld)
         .ok_or_else(|| format!("Invalid TLD for candidate generation: {raw_tld}"))?;
     let top = args.top.unwrap_or(count);
-    let candidates = generate_premium_candidates(&CandidateGenerationConfig { count, top, tld });
+    let (min_length, max_length) = generation_length_bounds(args);
+    let candidates = generate_premium_candidates(&CandidateGenerationConfig {
+        count,
+        top,
+        tld,
+        min_length,
+        max_length,
+    });
     if candidates.len() != top {
+        let length_requirement = if min_length == max_length {
+            format!(" with a {min_length}-character label")
+        } else {
+            format!(" with a {min_length}..={max_length}-character label")
+        };
         return Err(format!(
-            "Could only generate {} valid unique candidates (requested {})",
+            "Could only generate {} valid unique candidates{} (requested {}); increase --generate or widen the length range",
             candidates.len(),
+            length_requirement,
             top
         )
         .into());
@@ -1361,6 +1425,9 @@ mod tests {
             dry_run: false,
             generate_count: None,
             top: None,
+            length: None,
+            min_length: None,
+            max_length: None,
             score_only: false,
             yes: false,
             help: false,
@@ -1499,6 +1566,8 @@ mod tests {
             count: 10,
             top: 2,
             tld: "com".to_string(),
+            min_length: 5,
+            max_length: 10,
         });
         let csv = render_score_only_csv(&candidates);
         assert!(csv.starts_with("domain,investment_score,generation_quality_score"));

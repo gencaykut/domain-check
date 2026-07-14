@@ -116,6 +116,13 @@ pub fn print_custom_help() {
     print_flag("", "--top <COUNT>", "Keep the best N generated candidates");
     print_flag(
         "",
+        "--length <N>",
+        "Require an exact generated label length",
+    );
+    print_flag("", "--min-length <N>", "Minimum generated label length");
+    print_flag("", "--max-length <N>", "Maximum generated label length");
+    print_flag(
+        "",
         "--score-only",
         "Score candidates without network checks",
     );
@@ -175,6 +182,10 @@ pub fn print_custom_help() {
     print_example(
         "domain-check --generate 30000 --top 1000 -t com --score-only",
         "Create a deterministic premium candidate list offline",
+    );
+    print_example(
+        "domain-check --generate 500000 --top 5000 --length 5 -t com --score-only",
+        "Create 5,000 five-letter premium candidates",
     );
 
     println!();

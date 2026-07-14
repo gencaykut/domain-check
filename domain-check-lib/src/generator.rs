@@ -10,12 +10,40 @@ use std::collections::{HashMap, HashSet};
 const CONSONANTS: &[u8] = b"lrvsmnctpldrvnsgkfbhjwz";
 const VOWELS: &[u8] = b"aeiou";
 const PATTERNS: &[&str] = &["CVCVC", "CVCVCV", "CVCCVC", "CVCVCVC"];
+const LENGTH_CONSTRAINED_PATTERNS: &[&str] = &[
+    "CVCVC",
+    "VCVCV",
+    "CVVCV",
+    "CVCVV",
+    "CVCCV",
+    "CCVCV", // 5
+    "CVCVCV",
+    "CVCCVC",
+    "VCVCVC",
+    "CVCVVC",
+    "CVVCVC",
+    "CCVCVC", // 6
+    "CVCVCVC",
+    "VCVCVCV",
+    "CVCVCVV",
+    "CVVCVCV",
+    "CVCCVCV", // 7
+    "CVCVCVCV",
+    "VCVCVCVC",
+    "CVVCVCVC",
+    "CVCVCCVC", // 8
+    "CVCVCVCVC",
+    "VCVCVCVCV",
+    "CVVCVCVCV", // 9
+    "CVCVCVCVCV",
+    "VCVCVCVCVC",
+    "CVVCVCVCVC", // 10
+];
 const SAFE_SYLLABLES: &[&str] = &[
     "al", "ara", "avi", "bel", "bo", "ca", "dari", "do", "ela", "eva", "ivo", "lari", "le", "lo",
     "luma", "mari", "mi", "navi", "ne", "nora", "nova", "ora", "ravi", "re", "ria", "sani", "se",
     "sol", "tavi", "te", "uma", "va", "vela", "vero", "vi", "via", "za", "zen",
 ];
-const GENERATION_FAMILIES: usize = PATTERNS.len() + 1;
 const NEGATIVE_PARTS: &[&str] = &[
     "abuse", "adult", "bitch", "cock", "crime", "cunt", "damn", "death", "dick", "drug", "fraud",
     "fuck", "hate", "idiot", "jail", "kill", "loser", "meth", "moron", "nazi", "ponzi", "porn",
@@ -114,6 +142,9 @@ pub struct CandidateGenerationConfig {
     pub count: usize,
     pub top: usize,
     pub tld: String,
+    /// Inclusive second-level label length bounds. Premium generation supports 5..=10.
+    pub min_length: usize,
+    pub max_length: usize,
 }
 
 /// A generated domain and its explainable local investment score.
@@ -159,12 +190,34 @@ pub fn normalize_tld(tld: &str) -> Option<String> {
 ///
 /// The fixed pattern order and index permutation make identical configurations reproducible.
 pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<ScoredCandidate> {
-    if config.count == 0 || config.top == 0 {
+    if config.count == 0
+        || config.top == 0
+        || config.min_length < 5
+        || config.max_length > 10
+        || config.min_length > config.max_length
+    {
         return Vec::new();
     }
     let Some(tld) = normalize_tld(&config.tld) else {
         return Vec::new();
     };
+
+    let constrained = config.min_length != 5 || config.max_length != 10;
+    let patterns: Vec<&str> = if constrained {
+        LENGTH_CONSTRAINED_PATTERNS
+            .iter()
+            .copied()
+            .filter(|pattern| (config.min_length..=config.max_length).contains(&pattern.len()))
+            .collect()
+    } else {
+        PATTERNS.to_vec()
+    };
+    let include_syllables =
+        (config.min_length..=config.max_length).any(|length| (5..=10).contains(&length));
+    let generation_families = patterns.len() + usize::from(include_syllables);
+    if generation_families == 0 {
+        return Vec::new();
+    }
 
     let mut candidates = Vec::with_capacity(config.count);
     let mut seen = HashSet::with_capacity(config.count);
@@ -172,10 +225,10 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
     let max_attempts = config.count.saturating_mul(30).max(100);
 
     while candidates.len() < config.count && sequence < max_attempts {
-        let pattern_index = sequence % GENERATION_FAMILIES;
-        let ordinal = sequence / GENERATION_FAMILIES;
-        let name = if pattern_index < PATTERNS.len() {
-            let pattern = PATTERNS[pattern_index];
+        let pattern_index = sequence % generation_families;
+        let ordinal = sequence / generation_families;
+        let name = if pattern_index < patterns.len() {
+            let pattern = patterns[pattern_index];
             let space = pattern_space(pattern);
             // Odd constants spread adjacent requests across the pattern space without randomness.
             let permuted = ordinal.wrapping_mul(104_729).wrapping_add(7_919) % space;
@@ -185,7 +238,11 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
         };
         sequence += 1;
 
-        if !is_premium_name(&name) || is_reserved_collision(&name) || !seen.insert(name.clone()) {
+        if !(config.min_length..=config.max_length).contains(&name.len())
+            || !is_premium_name(&name)
+            || is_reserved_collision(&name)
+            || !seen.insert(name.clone())
+        {
             continue;
         }
         let domain = format!("{name}.{tld}");
@@ -207,14 +264,22 @@ pub fn generate_premium_candidates(config: &CandidateGenerationConfig) -> Vec<Sc
             .then_with(|| right.scoring.total_score.cmp(&left.scoring.total_score))
             .then_with(|| left.domain.cmp(&right.domain))
     });
-    select_diverse(candidates, config.top.min(config.count))
+    select_diverse(
+        candidates,
+        config.top.min(config.count),
+        generation_families,
+    )
 }
 
-fn select_diverse(candidates: Vec<ScoredCandidate>, top: usize) -> Vec<ScoredCandidate> {
-    let per_pattern_limit = top.div_ceil(GENERATION_FAMILIES).max(1);
+fn select_diverse(
+    candidates: Vec<ScoredCandidate>,
+    top: usize,
+    generation_families: usize,
+) -> Vec<ScoredCandidate> {
+    let per_pattern_limit = top.div_ceil(generation_families).max(1);
     let mut selected = Vec::with_capacity(top);
     let mut selected_domains = HashSet::new();
-    let mut pattern_counts = [0usize; GENERATION_FAMILIES];
+    let mut pattern_counts = vec![0usize; generation_families];
     let mut family_counts: HashMap<String, usize> = HashMap::new();
     let mut prefix_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut suffix_counts: HashMap<&'static str, usize> = HashMap::new();
@@ -581,6 +646,8 @@ mod tests {
             count,
             top,
             tld: tld.to_string(),
+            min_length: 5,
+            max_length: 10,
         }
     }
 
@@ -614,7 +681,7 @@ mod tests {
     fn top_results_include_multiple_patterns() {
         let candidates = generate_premium_candidates(&config(1_000, 100, "com"));
         let patterns: HashSet<_> = candidates.iter().map(|item| item.pattern_index).collect();
-        assert_eq!(patterns.len(), GENERATION_FAMILIES);
+        assert_eq!(patterns.len(), PATTERNS.len() + 1);
 
         let mut families = HashMap::new();
         for candidate in candidates {
@@ -714,5 +781,39 @@ mod tests {
             .windows(2)
             .all(|pair| pair[0].generation_quality.total_score
                 >= pair[1].generation_quality.total_score));
+    }
+
+    #[test]
+    fn exact_length_only_returns_matching_labels_and_is_deterministic() {
+        let mut exact = config(10_000, 500, "com");
+        exact.min_length = 5;
+        exact.max_length = 5;
+        let first = generate_premium_candidates(&exact);
+        let second = generate_premium_candidates(&exact);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 500);
+        assert!(first
+            .iter()
+            .all(|candidate| candidate.domain.split('.').next().unwrap().len() == 5));
+    }
+
+    #[test]
+    fn length_range_is_inclusive() {
+        let mut ranged = config(5_000, 500, "com");
+        ranged.min_length = 6;
+        ranged.max_length = 7;
+        let candidates = generate_premium_candidates(&ranged);
+        assert_eq!(candidates.len(), 500);
+        assert!(candidates.iter().all(|candidate| {
+            (6..=7).contains(&candidate.domain.split('.').next().unwrap().len())
+        }));
+    }
+
+    #[test]
+    fn impossible_length_configuration_returns_no_candidates() {
+        let mut invalid = config(100, 20, "com");
+        invalid.min_length = 11;
+        invalid.max_length = 5;
+        assert!(generate_premium_candidates(&invalid).is_empty());
     }
 }
