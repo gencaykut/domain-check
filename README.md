@@ -21,6 +21,7 @@ Quick Links: [Installation](#installation) | [Quick Start](#quick-start) | [Use 
 - **Dual-protocol engine** — RDAP-first with automatic WHOIS fallback. IANA server discovery covers ~189 ccTLDs that lack RDAP (`.es`, `.co`, `.eu`, `.jp`).
 - **Fast** — up to 100 concurrent checks, streaming results as they complete. 2.7 MB release binary.
 - **Domain generation** — pattern expansion (`\w`=letter, `\d`=digit, `?`=either), prefix/suffix permutations, and `--dry-run` to preview before checking.
+- **Premium candidate generation** — deterministic, offline phonetic name generation with local scoring, diversity filtering, and `--score-only` output.
 - **11 curated presets** — `startup`, `tech`, `creative`, `finance`, `ecommerce`, and more. Or define your own in config.
 - **Rich output** — grouped pretty display, JSON, CSV. Registrar info, creation/expiration dates, and status codes with `--info`.
 - **CI and automation friendly** — `--json`/`--csv` to stdout, `--yes` to skip prompts, `--force` for large runs, automatic non-TTY detection.
@@ -51,6 +52,12 @@ domain-check myapp --preset startup --pretty
 
 # Generate names with a pattern (preview only)
 domain-check --pattern "app\d" -t com --dry-run
+
+# Generate 30,000 candidates and output the best 1,000 without network requests
+domain-check --generate 30000 --top 1000 -t com --score-only
+
+# Export locally scored candidates as CSV
+domain-check --generate 30000 --top 1000 -t com --score-only --csv > premium-1000.csv
 
 # Add prefixes and suffixes
 domain-check myapp --prefix get,try --suffix hub,ly -t com,io

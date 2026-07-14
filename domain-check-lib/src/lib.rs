@@ -42,10 +42,14 @@ pub use utils::expand_domain_inputs;
 
 // Public modules
 pub mod generate;
+pub mod generator;
 pub mod scoring;
 
 // Re-export generation types for convenience
 pub use generate::{apply_affixes, estimate_pattern_count, expand_pattern, generate_names};
+pub use generator::{
+    generate_premium_candidates, normalize_tld, CandidateGenerationConfig, ScoredCandidate,
+};
 pub use scoring::{score_domain, InvestmentScore};
 pub use types::{GenerateConfig, GenerationResult};
 

@@ -42,6 +42,92 @@ fn test_help_shows_score_flag() {
 }
 
 #[test]
+fn test_help_shows_premium_generation_flags() {
+    let mut cmd = Command::cargo_bin("domain-check").unwrap();
+    cmd.arg("--help");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("--generate <COUNT>"))
+        .stdout(predicate::str::contains("--top <COUNT>"))
+        .stdout(predicate::str::contains("--score-only"));
+}
+
+#[test]
+fn test_score_only_text_is_deterministic_and_network_free() {
+    let args = [
+        "--generate",
+        "100",
+        "--top",
+        "20",
+        "--tld",
+        ".COM",
+        "--score-only",
+    ];
+    let first = Command::cargo_bin("domain-check")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+    let second = Command::cargo_bin("domain-check")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    let stdout = String::from_utf8(first.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 20);
+    assert!(stdout.lines().all(|line| line.contains(".com ")));
+    assert!(!stdout.contains("AVAILABLE"));
+    assert!(!stdout.contains("UNKNOWN"));
+}
+
+#[test]
+fn test_score_only_csv_schema() {
+    let mut cmd = Command::cargo_bin("domain-check").unwrap();
+    cmd.args(["--generate", "50", "--top", "5", "--score-only", "--csv"]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::starts_with(
+            "domain,investment_score,length_score,pronounceability_score",
+        ))
+        .stdout(predicate::str::contains("reasons\n"));
+}
+
+#[test]
+fn test_score_only_json_schema() {
+    let output = Command::cargo_bin("domain-check")
+        .unwrap()
+        .args(["--generate", "50", "--top", "5", "--score-only", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 5);
+    assert!(json[0]["domain"].as_str().unwrap().ends_with(".com"));
+    assert!(json[0]["scoring"]["total_score"].is_number());
+    assert!(json[0]["scoring"]["reasons"].is_array());
+}
+
+#[test]
+fn test_generate_input_conflicts_are_clear() {
+    let cases = [
+        vec!["manual", "--generate", "10"],
+        vec!["--generate", "10", "--pattern", "a\\d"],
+        vec!["--generate", "10", "--top", "11"],
+        vec!["--score-only"],
+        vec!["--generate", "10", "--tld", "com,io"],
+    ];
+    for args in cases {
+        Command::cargo_bin("domain-check")
+            .unwrap()
+            .args(args)
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
 fn test_list_presets_output() {
     let mut cmd = Command::cargo_bin("domain-check").unwrap();
     cmd.arg("--list-presets");
@@ -605,7 +691,7 @@ fn test_no_input_error() {
     cmd.args::<[&str; 0], &str>([]);
 
     cmd.assert().failure().stderr(predicate::str::contains(
-        "You must specify domain names, a file with --file, or patterns with --pattern",
+        "You must specify domain names, --file, --pattern, or --generate",
     ));
 }
 

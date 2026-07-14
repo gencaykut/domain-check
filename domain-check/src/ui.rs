@@ -58,6 +58,12 @@ pub fn print_custom_help() {
         style("--pattern <PATTERN>").white(),
         style("[--flags]").dim()
     );
+    println!(
+        "   {} {} {}",
+        style("domain-check").cyan().bold(),
+        style("--generate <COUNT>").white(),
+        style("[--top <COUNT>] [--score-only]").dim()
+    );
 
     // DOMAIN SELECTION
     print_section("DOMAIN SELECTION");
@@ -105,6 +111,13 @@ pub fn print_custom_help() {
         "",
         "--dry-run",
         "Preview generated domains without checking",
+    );
+    print_flag("", "--generate <COUNT>", "Generate premium raw candidates");
+    print_flag("", "--top <COUNT>", "Keep the best N generated candidates");
+    print_flag(
+        "",
+        "--score-only",
+        "Score candidates without network checks",
     );
 
     // OUTPUT FORMAT
@@ -158,6 +171,10 @@ pub fn print_custom_help() {
     print_example(
         "domain-check --pattern \"app\\d\" --dry-run",
         "Preview pattern-generated names",
+    );
+    print_example(
+        "domain-check --generate 30000 --top 1000 -t com --score-only",
+        "Create a deterministic premium candidate list offline",
     );
 
     println!();

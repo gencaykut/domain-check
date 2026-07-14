@@ -8,11 +8,14 @@ mod ui;
 use clap::Parser;
 use console::Term;
 use domain_check_lib::{
+    generate_premium_candidates, normalize_tld, score_domain, CandidateGenerationConfig,
+    CheckConfig, DomainChecker, DomainResult, ScoredCandidate,
+};
+use domain_check_lib::{
     get_all_known_tlds, get_available_presets, get_preset_tlds, get_preset_tlds_with_custom,
     initialize_bootstrap,
 };
 use domain_check_lib::{load_env_config, ConfigManager, FileConfig};
-use domain_check_lib::{score_domain, CheckConfig, DomainChecker, DomainResult};
 use std::io::BufRead;
 use std::process;
 
@@ -90,6 +93,22 @@ pub struct Args {
     /// Preview generated domains without checking availability
     #[arg(long = "dry-run", help_heading = "Domain Generation")]
     pub dry_run: bool,
+
+    /// Generate a deterministic number of premium raw candidates
+    #[arg(
+        long = "generate",
+        value_name = "COUNT",
+        help_heading = "Domain Generation"
+    )]
+    pub generate_count: Option<usize>,
+
+    /// Keep the best N generated candidates after local scoring
+    #[arg(long = "top", value_name = "COUNT", help_heading = "Domain Generation")]
+    pub top: Option<usize>,
+
+    /// Output generated candidates and scores without network checks
+    #[arg(long = "score-only", help_heading = "Domain Generation")]
+    pub score_only: bool,
 
     /// Output results in JSON format
     #[arg(short = 'j', long = "json", help_heading = "Output Format")]
@@ -206,12 +225,54 @@ fn validate_args(args: &Args) -> Result<(), String> {
         return Ok(());
     }
 
-    // Must have either domains, file, or patterns
-    if args.domains.is_empty() && args.file.is_none() && args.patterns.is_none() {
-        return Err(
-            "You must specify domain names, a file with --file, or patterns with --pattern"
-                .to_string(),
-        );
+    // Must have either domains, file, patterns, or premium generation
+    if args.domains.is_empty()
+        && args.file.is_none()
+        && args.patterns.is_none()
+        && args.generate_count.is_none()
+    {
+        return Err("You must specify domain names, --file, --pattern, or --generate".to_string());
+    }
+
+    if let Some(count) = args.generate_count {
+        if count == 0 {
+            return Err("--generate COUNT must be greater than zero".to_string());
+        }
+        if count > 1_000_000 && !args.force {
+            return Err(
+                "--generate is limited to 1,000,000 candidates; use --force to override"
+                    .to_string(),
+            );
+        }
+        if !args.domains.is_empty() || args.file.is_some() || args.patterns.is_some() {
+            return Err(
+                "--generate cannot be combined with manual domains, --file, or --pattern"
+                    .to_string(),
+            );
+        }
+        if args.prefixes.is_some() || args.suffixes.is_some() {
+            return Err("--generate cannot be combined with --prefix or --suffix".to_string());
+        }
+        if args.preset.is_some() || args.all_tlds {
+            return Err(
+                "--generate accepts one --tld only; --preset and --all are not supported"
+                    .to_string(),
+            );
+        }
+        if args.tlds.as_ref().is_some_and(|tlds| tlds.len() != 1) {
+            return Err("--generate accepts exactly one --tld".to_string());
+        }
+        if let Some(top) = args.top {
+            if top == 0 || top > count {
+                return Err("--top COUNT must be between 1 and --generate COUNT".to_string());
+            }
+        }
+    } else if args.top.is_some() || args.score_only {
+        return Err("--top and --score-only require --generate".to_string());
+    }
+
+    if args.score_only && args.dry_run {
+        return Err("--score-only cannot be combined with --dry-run".to_string());
     }
 
     // Can't have conflicting output modes
@@ -295,6 +356,12 @@ fn should_enable_bootstrap(args: &Args, _resolved_tlds: &Option<Vec<String>>) ->
 
 /// Main domain checking logic
 async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let generated = generated_candidates_from_args(&args)?;
+    if args.score_only {
+        display_score_only(generated.as_deref().unwrap_or_default(), &args)?;
+        return Ok(());
+    }
+
     // Pre-warm bootstrap cache if --all mode is requested (so get_all_known_tlds()
     // returns the full ~1,180 TLDs from IANA, not just the 32 hardcoded ones)
     if args.all_tlds && !args.no_bootstrap {
@@ -320,7 +387,11 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
     args.info = config.detailed_info;
 
     // Determine domains to check (pass the config instead of rebuilding)
-    let domains = get_domains_to_check(&args, &config).await?;
+    let domains = if let Some(candidates) = generated {
+        candidates.into_iter().map(|item| item.domain).collect()
+    } else {
+        get_domains_to_check(&args, &config).await?
+    };
 
     // Dry-run: print domains and exit without checking
     if args.dry_run {
@@ -1016,6 +1087,75 @@ async fn read_domains_from_file(
     Ok(domains)
 }
 
+fn generated_candidates_from_args(
+    args: &Args,
+) -> Result<Option<Vec<ScoredCandidate>>, Box<dyn std::error::Error>> {
+    let Some(count) = args.generate_count else {
+        return Ok(None);
+    };
+    let raw_tld = args
+        .tlds
+        .as_ref()
+        .and_then(|tlds| tlds.first())
+        .map(String::as_str)
+        .unwrap_or("com");
+    let tld = normalize_tld(raw_tld)
+        .ok_or_else(|| format!("Invalid TLD for candidate generation: {raw_tld}"))?;
+    let top = args.top.unwrap_or(count);
+    let candidates = generate_premium_candidates(&CandidateGenerationConfig { count, top, tld });
+    if candidates.len() != top {
+        return Err(format!(
+            "Could only generate {} valid unique candidates (requested {})",
+            candidates.len(),
+            top
+        )
+        .into());
+    }
+    Ok(Some(candidates))
+}
+
+fn display_score_only(
+    candidates: &[ScoredCandidate],
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(candidates)?);
+    } else if args.csv {
+        print!("{}", render_score_only_csv(candidates));
+    } else {
+        for candidate in candidates {
+            println!(
+                "{} {} {}",
+                candidate.domain,
+                candidate.scoring.total_score,
+                candidate.scoring.reasons.join(" | ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_score_only_csv(candidates: &[ScoredCandidate]) -> String {
+    let mut output = String::from(
+        "domain,investment_score,length_score,pronounceability_score,spelling_score,commercial_score,risk_penalty,reasons\n",
+    );
+    for candidate in candidates {
+        let score = &candidate.scoring;
+        output.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            csv_escape(&candidate.domain),
+            score.total_score,
+            score.length_score,
+            score.pronounceability_score,
+            score.spelling_score,
+            score.commercial_score,
+            score.risk_penalty,
+            csv_escape(&score.reasons.join(" | "))
+        ));
+    }
+    output
+}
+
 fn display_results(
     results: &[domain_check_lib::DomainResult],
     args: &Args,
@@ -1210,6 +1350,9 @@ mod tests {
             prefixes: None,
             suffixes: None,
             dry_run: false,
+            generate_count: None,
+            top: None,
+            score_only: false,
             yes: false,
             help: false,
         }
@@ -1326,6 +1469,32 @@ mod tests {
 
         let result = validate_args(&args);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_generate_conflicts() {
+        let mut args = create_test_args();
+        args.generate_count = Some(100);
+        args.top = Some(20);
+        assert!(validate_args(&args).is_ok());
+
+        args.domains.push("manual".to_string());
+        assert!(validate_args(&args)
+            .unwrap_err()
+            .contains("cannot be combined"));
+    }
+
+    #[test]
+    fn test_score_only_csv_contains_local_score_schema() {
+        let candidates = generate_premium_candidates(&CandidateGenerationConfig {
+            count: 10,
+            top: 2,
+            tld: "com".to_string(),
+        });
+        let csv = render_score_only_csv(&candidates);
+        assert!(csv.starts_with("domain,investment_score,length_score"));
+        assert_eq!(csv.lines().count(), 3);
+        assert!(!csv.contains("available"));
     }
 
     #[test]
