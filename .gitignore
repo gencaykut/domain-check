@@ -35,3 +35,6 @@ domains.txt
 
 # Project-local persistent query history
 .domain-check-history.jsonl
+
+# Local dictionary source
+words_alpha.txt
