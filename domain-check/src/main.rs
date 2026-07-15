@@ -14,7 +14,7 @@ use domain_check_lib::generate_premium_candidates;
 use domain_check_lib::{
     generate_premium_candidates_with_filters_and_stats, normalize_tld, score_domain,
     CandidateGenerationConfig, CandidateGenerationFilters, CheckConfig, DomainChecker,
-    DomainResult, ScoredCandidate,
+    DomainResult, GenerationQualityScore, ScoredCandidate,
 };
 use domain_check_lib::{
     get_all_known_tlds, get_available_presets, get_preset_tlds, get_preset_tlds_with_custom,
@@ -159,6 +159,14 @@ pub struct Args {
     /// Output generated candidates and scores without network checks
     #[arg(long = "score-only", help_heading = "Domain Generation")]
     pub score_only: bool,
+
+    /// Reject generated candidates below this linguistic quality score (0-100)
+    #[arg(
+        long = "min-generation-quality",
+        value_name = "0-100",
+        help_heading = "Domain Generation"
+    )]
+    pub min_generation_quality: Option<u8>,
 
     /// Output results in JSON format
     #[arg(short = 'j', long = "json", help_heading = "Output Format")]
@@ -360,6 +368,9 @@ fn validate_args(args: &Args) -> Result<(), String> {
         }
         validate_generation_lengths(args)?;
         validate_generation_filters(args)?;
+        if args.min_generation_quality.is_some_and(|value| value > 100) {
+            return Err("--min-generation-quality must be between 0 and 100".to_string());
+        }
     } else if args.top.is_some()
         || args.score_only
         || args.length.is_some()
@@ -368,8 +379,11 @@ fn validate_args(args: &Args) -> Result<(), String> {
         || args.contains.is_some()
         || args.starts_with.is_some()
         || args.ends_with.is_some()
+        || args.min_generation_quality.is_some()
     {
-        return Err("--top, --score-only, length, and text filters require --generate".to_string());
+        return Err(
+            "--top, --score-only, length, quality, and text filters require --generate".to_string(),
+        );
     }
 
     if args.score_only && args.dry_run {
@@ -510,6 +524,17 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
         display_score_only(generated.as_deref().unwrap_or_default(), &args)?;
         return Ok(());
     }
+    let generation_quality: std::collections::HashMap<String, GenerationQualityScore> = generated
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|candidate| {
+            (
+                history::normalize_domain(&candidate.domain),
+                candidate.generation_quality.clone(),
+            )
+        })
+        .collect();
 
     // Pre-warm bootstrap cache if --all mode is requested (so get_all_known_tlds()
     // returns the full ~1,180 TLDs from IANA, not just the 32 hardcoded ones)
@@ -571,6 +596,10 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
         history_reused: cached_results.len(),
         duplicates_skipped: duplicate_count,
     };
+    let output_context = RunOutputContext {
+        history_stats,
+        generation_quality: &generation_quality,
+    };
 
     // Interactive confirmation for large runs (TTY only)
     if domains.len() > 5000 && !args.force && !args.yes {
@@ -608,7 +637,7 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
             &args,
             &config.tlds,
             history_store.as_mut(),
-            history_stats,
+            output_context,
         )
         .await?;
     } else {
@@ -620,7 +649,7 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
             &requested_domains,
             &args,
             history_store.as_mut(),
-            history_stats,
+            output_context,
         )
         .await?;
     }
@@ -635,6 +664,12 @@ struct HistoryStats {
     new_queries: usize,
     history_reused: usize,
     duplicates_skipped: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RunOutputContext<'a> {
+    history_stats: HistoryStats,
+    generation_quality: &'a std::collections::HashMap<String, GenerationQualityScore>,
 }
 
 fn history_path(args: &Args) -> PathBuf {
@@ -685,6 +720,13 @@ fn should_use_streaming(args: &Args, domain_count: usize) -> bool {
         return true;
     }
 
+    // Generated candidates are already ranked by generation quality. Keep that
+    // order in the default text output instead of displaying network completion
+    // order, which can make weaker candidates appear at the top.
+    if args.generate_count.is_some() {
+        return false;
+    }
+
     // Use streaming for multiple domains unless in JSON/CSV mode
     if domain_count > 1 && !args.json && !args.csv {
         return true;
@@ -702,7 +744,7 @@ async fn run_streaming_check(
     args: &Args,
     tlds: &Option<Vec<String>>,
     history_store: Option<&mut history::HistoryStore>,
-    history_stats: HistoryStats,
+    output_context: RunOutputContext<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use futures_util::StreamExt;
 
@@ -763,6 +805,7 @@ async fn run_streaming_check(
         if args.score {
             ui::print_investment_score(&score_domain(&cached.domain));
         }
+        print_generation_quality_for(&cached.domain, output_context.generation_quality);
         results.push(cached);
     }
 
@@ -817,6 +860,7 @@ async fn run_streaming_check(
         if args.score {
             ui::print_investment_score(&score_domain(&domain_result.domain));
         }
+        print_generation_quality_for(&domain_result.domain, output_context.generation_quality);
         new_results.push(domain_result.clone());
         results.push(domain_result);
     }
@@ -838,7 +882,7 @@ async fn run_streaming_check(
             duration,
         );
     }
-    print_history_stats(history_stats, args.json || args.csv);
+    print_history_stats(output_context.history_stats, args.json || args.csv);
 
     Ok(())
 }
@@ -851,13 +895,13 @@ async fn run_batch_check(
     requested_domains: &[String],
     args: &Args,
     history_store: Option<&mut history::HistoryStore>,
-    history_stats: HistoryStats,
+    output_context: RunOutputContext<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_structured = args.json || args.csv;
 
     // Show header (pretty only — default mode lets the spinner + summary speak)
-    if args.pretty && !is_structured && domains.len() > 1 {
-        ui::print_header(domains.len(), checker.config().concurrency, args);
+    if args.pretty && !is_structured && requested_domains.len() > 1 {
+        ui::print_header(requested_domains.len(), checker.config().concurrency, args);
     } else if domains.len() > 1 && args.verbose {
         println!("🔍 Checking {} domains...", domains.len());
         if args.all_tlds {
@@ -899,8 +943,8 @@ async fn run_batch_check(
     }
 
     // Display results based on format
-    display_results(&results, args, duration)?;
-    print_history_stats(history_stats, is_structured);
+    display_results(&results, args, duration, output_context.generation_quality)?;
+    print_history_stats(output_context.history_stats, is_structured);
 
     Ok(())
 }
@@ -1398,6 +1442,7 @@ fn generated_candidates_from_args(
     let tld = normalize_tld(raw_tld)
         .ok_or_else(|| format!("Invalid TLD for candidate generation: {raw_tld}"))?;
     let top = args.top.unwrap_or(count);
+    let min_generation_quality = args.min_generation_quality.unwrap_or(70);
     let (min_length, max_length) = generation_length_bounds(args);
     let (candidates, history_skipped) = generate_premium_candidates_with_filters_and_stats(
         &CandidateGenerationConfig {
@@ -1406,6 +1451,7 @@ fn generated_candidates_from_args(
             tld,
             min_length,
             max_length,
+            min_generation_quality,
         },
         &CandidateGenerationFilters {
             contains: args
@@ -1430,9 +1476,10 @@ fn generated_candidates_from_args(
             format!(" with a {min_length}..={max_length}-character label")
         };
         return Err(format!(
-            "Could only generate {} valid unique candidates{} (requested {}); increase --generate or widen the length range",
+            "Could only generate {} valid unique candidates{} at generation quality >= {} (requested {}); increase --generate, lower --min-generation-quality, or widen the length range",
             candidates.len(),
             length_requirement,
+            min_generation_quality,
             top
         )
         .into());
@@ -1498,13 +1545,14 @@ fn display_results(
     results: &[domain_check_lib::DomainResult],
     args: &Args,
     duration: std::time::Duration,
+    generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if args.json {
-        display_json_results(results, args.score)?;
+        display_json_results(results, args.score, generation_quality)?;
     } else if args.csv {
-        display_csv_results(results, args.score)?;
+        display_csv_results(results, args.score, generation_quality)?;
     } else {
-        display_text_results(results, args, duration)?;
+        display_text_results(results, args, duration, generation_quality)?;
     }
 
     Ok(())
@@ -1514,9 +1562,14 @@ fn display_results(
 fn display_json_results(
     results: &[domain_check_lib::DomainResult],
     include_score: bool,
+    generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let json = if include_score {
-        serde_json::to_string_pretty(&scored_json_value(results)?)?
+    let json = if include_score || !generation_quality.is_empty() {
+        serde_json::to_string_pretty(&enriched_json_value(
+            results,
+            include_score,
+            generation_quality,
+        )?)?
     } else {
         serde_json::to_string_pretty(results)?
     };
@@ -1524,16 +1577,35 @@ fn display_json_results(
     Ok(())
 }
 
+#[cfg(test)]
 fn scored_json_value(results: &[DomainResult]) -> Result<serde_json::Value, serde_json::Error> {
+    enriched_json_value(results, true, &std::collections::HashMap::new())
+}
+
+fn enriched_json_value(
+    results: &[DomainResult],
+    include_score: bool,
+    generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+) -> Result<serde_json::Value, serde_json::Error> {
     let values = results
         .iter()
         .map(|result| {
             let mut value = serde_json::to_value(result)?;
             if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "scoring".to_string(),
-                    serde_json::to_value(score_domain(&result.domain))?,
-                );
+                if include_score {
+                    object.insert(
+                        "scoring".to_string(),
+                        serde_json::to_value(score_domain(&result.domain))?,
+                    );
+                }
+                if let Some(quality) =
+                    generation_quality.get(&history::normalize_domain(&result.domain))
+                {
+                    object.insert(
+                        "generation_quality".to_string(),
+                        serde_json::to_value(quality)?,
+                    );
+                }
             }
             Ok(value)
         })
@@ -1545,17 +1617,34 @@ fn scored_json_value(results: &[DomainResult]) -> Result<serde_json::Value, serd
 fn display_csv_results(
     results: &[domain_check_lib::DomainResult],
     include_score: bool,
+    generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    print!("{}", render_csv_results(results, include_score));
+    print!(
+        "{}",
+        render_csv_results_with_generation(results, include_score, generation_quality)
+    );
     Ok(())
 }
 
+#[cfg(test)]
 fn render_csv_results(results: &[DomainResult], include_score: bool) -> String {
+    render_csv_results_with_generation(results, include_score, &std::collections::HashMap::new())
+}
+
+fn render_csv_results_with_generation(
+    results: &[DomainResult],
+    include_score: bool,
+    generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+) -> String {
     let mut output = String::new();
     if include_score {
         output.push_str("domain,available,registrar,created,expires,method,investment_score,length_score,pronounceability_score,spelling_score,commercial_score,risk_penalty,reasons\n");
     } else {
         output.push_str("domain,available,registrar,created,expires,method\n");
+    }
+    if !generation_quality.is_empty() {
+        output.truncate(output.len() - 1);
+        output.push_str(",generation_quality_score,phonotactic_score,boundary_score,rhythm_score,naturalness_score,generation_penalty,generation_reasons\n");
     }
 
     for result in results {
@@ -1607,6 +1696,24 @@ fn render_csv_results(results: &[DomainResult], include_score: bool) -> String {
                 csv_escape(&score.reasons.join(" | "))
             ));
         }
+        if !generation_quality.is_empty() {
+            if let Some(quality) =
+                generation_quality.get(&history::normalize_domain(&result.domain))
+            {
+                output.push_str(&format!(
+                    ",{},{},{},{},{},{},{}",
+                    quality.total_score,
+                    quality.phonotactic_score,
+                    quality.boundary_score,
+                    quality.rhythm_score,
+                    quality.naturalness_score,
+                    quality.penalty,
+                    csv_escape(&quality.reasons.join(" | "))
+                ));
+            } else {
+                output.push_str(",,,,,,,");
+            }
+        }
         output.push('\n');
     }
 
@@ -1621,15 +1728,36 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
+fn print_generation_quality_for(
+    domain: &str,
+    generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+) {
+    if let Some(quality) = generation_quality.get(&history::normalize_domain(domain)) {
+        let reason = if quality.reasons.is_empty() {
+            "no additional quality signal".to_string()
+        } else {
+            quality.reasons.join(" | ")
+        };
+        println!(
+            "    Generation quality: {}/100  {}",
+            quality.total_score, reason
+        );
+    }
+}
+
 /// Display results in human-readable text format
 fn display_text_results(
     results: &[domain_check_lib::DomainResult],
     args: &Args,
     duration: std::time::Duration,
+    generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if args.pretty {
         // Pretty mode: grouped layout with section headers
         ui::print_grouped_results(results, args.info, args.debug, args.score);
+        for result in results {
+            print_generation_quality_for(&result.domain, generation_quality);
+        }
     } else {
         // Default mode: colored flat list
         for result in results {
@@ -1637,6 +1765,7 @@ fn display_text_results(
             if args.score {
                 ui::print_investment_score(&score_domain(&result.domain));
             }
+            print_generation_quality_for(&result.domain, generation_quality);
         }
     }
 
@@ -1697,6 +1826,7 @@ mod tests {
             starts_with: None,
             ends_with: None,
             score_only: false,
+            min_generation_quality: None,
             no_history: false,
             history_file: None,
             clear_history: false,
@@ -1704,6 +1834,23 @@ mod tests {
             yes: false,
             help: false,
         }
+    }
+
+    #[test]
+    fn test_generated_domains_default_to_rank_preserving_batch_mode() {
+        let mut args = create_test_args();
+        args.generate_count = Some(1000);
+
+        assert!(!should_use_streaming(&args, 100));
+    }
+
+    #[test]
+    fn test_explicit_streaming_overrides_generated_batch_default() {
+        let mut args = create_test_args();
+        args.generate_count = Some(1000);
+        args.streaming = true;
+
+        assert!(should_use_streaming(&args, 100));
     }
 
     #[test]
@@ -1840,6 +1987,7 @@ mod tests {
             tld: "com".to_string(),
             min_length: 5,
             max_length: 10,
+            min_generation_quality: 0,
         });
         let csv = render_score_only_csv(&candidates);
         assert!(csv.starts_with("domain,investment_score,generation_quality_score"));
@@ -1944,6 +2092,35 @@ mod tests {
         let value = scored_json_value(&[result]).unwrap();
         assert!(value[0]["scoring"]["total_score"].as_u64().unwrap() >= 80);
         assert!(value[0]["scoring"]["reasons"].is_array());
+    }
+
+    #[test]
+    fn test_generated_structured_output_adds_quality_without_removing_fields() {
+        let candidate = generate_premium_candidates(&CandidateGenerationConfig {
+            count: 100,
+            top: 1,
+            tld: "com".to_string(),
+            min_length: 6,
+            max_length: 6,
+            min_generation_quality: 0,
+        })
+        .remove(0);
+        let domain = candidate.domain.clone();
+        let quality = std::collections::HashMap::from([(
+            history::normalize_domain(&domain),
+            candidate.generation_quality,
+        )]);
+        let result = output_test_result(&domain);
+
+        let json = enriched_json_value(std::slice::from_ref(&result), true, &quality).unwrap();
+        assert!(json[0]["available"].is_boolean());
+        assert!(json[0]["scoring"]["total_score"].is_number());
+        assert!(json[0]["generation_quality"]["total_score"].is_number());
+
+        let csv = render_csv_results_with_generation(&[result], true, &quality);
+        assert!(csv.contains("investment_score"));
+        assert!(csv.contains("generation_quality_score"));
+        assert!(csv.contains(&domain));
     }
 
     #[test]

@@ -130,6 +130,11 @@ pub fn print_custom_help() {
     print_flag("", "--ends-with <TEXT>", "Require a label suffix");
     print_flag(
         "",
+        "--min-generation-quality <0-100>",
+        "Minimum linguistic quality (default: 70)",
+    );
+    print_flag(
+        "",
         "--score-only",
         "Score candidates without network checks",
     );

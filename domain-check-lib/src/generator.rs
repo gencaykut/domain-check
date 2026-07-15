@@ -135,6 +135,12 @@ const AWKWARD_VOWEL_TRANSITIONS: &[&str] =
 const UNCOMMON_DOUBLE_CONSONANTS: &[&str] = &[
     "bb", "cc", "dd", "ff", "gg", "hh", "jj", "kk", "mm", "pp", "qq", "vv", "ww", "xx", "zz",
 ];
+const ARTIFICIAL_ONSETS: &[&str] = &["bn", "dl", "fn", "hn", "kn", "mn", "rr", "ss", "tn"];
+const NATURAL_CONSONANT_ONSETS: &[&str] = &[
+    "bl", "br", "ch", "cl", "cr", "dr", "fl", "fr", "gl", "gr", "ph", "pl", "pr", "sc", "sh", "sk",
+    "sl", "sm", "sn", "sp", "st", "sw", "th", "tr", "tw", "wh", "wr",
+];
+const DENSE_FAMILY_FRAGMENTS: &[&str] = &["ara", "lar", "nor", "rav", "ria", "vel"];
 
 /// Settings for deterministic premium candidate generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +151,8 @@ pub struct CandidateGenerationConfig {
     /// Inclusive second-level label length bounds. Premium generation supports 5..=10.
     pub min_length: usize,
     pub max_length: usize,
+    /// Minimum generator-specific linguistic quality accepted for selection.
+    pub min_generation_quality: u8,
 }
 
 /// Optional second-level label filters for premium generation.
@@ -220,6 +228,7 @@ pub fn generate_premium_candidates_with_filters_and_stats(
         || config.min_length < 5
         || config.max_length > 10
         || config.min_length > config.max_length
+        || config.min_generation_quality > 100
     {
         return (Vec::new(), 0);
     }
@@ -250,10 +259,11 @@ pub fn generate_premium_candidates_with_filters_and_stats(
     let mut candidates = Vec::with_capacity(config.count);
     let mut seen = HashSet::with_capacity(config.count);
     let mut sequence = 0usize;
+    let mut raw_candidate_count = 0usize;
     let mut excluded_count = 0usize;
     let max_attempts = config.count.saturating_mul(30).max(100);
 
-    while candidates.len() < config.count && sequence < max_attempts {
+    while raw_candidate_count < config.count && sequence < max_attempts {
         let pattern_index = sequence % generation_families;
         let ordinal = sequence / generation_families;
         let raw_name = if pattern_index < patterns.len() {
@@ -283,8 +293,12 @@ pub fn generate_premium_candidates_with_filters_and_stats(
             excluded_count += 1;
             continue;
         }
+        raw_candidate_count += 1;
         let scoring = score_domain(&domain);
         let generation_quality = generation_quality_score(&name);
+        if generation_quality.total_score < config.min_generation_quality {
+            continue;
+        }
         candidates.push(ScoredCandidate {
             scoring,
             generation_quality,
@@ -422,12 +436,15 @@ fn select_diverse(
     let mut family_counts: HashMap<String, usize> = HashMap::new();
     let mut prefix_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut suffix_counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut dense_fragment_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut initial_counts: HashMap<u8, usize> = HashMap::new();
     let affix_limit = top.div_ceil(100).clamp(2, 10);
+    let family_limit = top.div_ceil(15).max(2);
+    let dense_fragment_limit = top.div_ceil(30).max(2);
     let initial_limit = if filters.starts_with.is_some() {
         top
     } else {
-        top.div_ceil(15).max(2)
+        top.div_ceil(8).max(3)
     };
 
     for candidate in &candidates {
@@ -435,8 +452,12 @@ fn select_diverse(
         let name = candidate.domain.split('.').next().unwrap_or_default();
         let prefix = matched_prefix(name);
         let suffix = matched_suffix(name);
+        let dense_fragments = dense_family_fragments(name);
         if pattern_counts[candidate.pattern_index] >= per_pattern_limit
-            || family_counts.get(&family).copied().unwrap_or(0) >= 2
+            || family_counts.get(&family).copied().unwrap_or(0) >= family_limit
+            || dense_fragments.iter().any(|fragment| {
+                dense_fragment_counts.get(fragment).copied().unwrap_or(0) >= dense_fragment_limit
+            })
             || prefix
                 .is_some_and(|value| prefix_counts.get(value).copied().unwrap_or(0) >= affix_limit)
             || suffix
@@ -455,12 +476,16 @@ fn select_diverse(
         if let Some(value) = suffix {
             *suffix_counts.entry(value).or_default() += 1;
         }
+        for fragment in dense_fragments {
+            *dense_fragment_counts.entry(fragment).or_default() += 1;
+        }
         if let Some(initial) = name.bytes().next() {
             *initial_counts.entry(initial).or_default() += 1;
         }
         selected_domains.insert(candidate.domain.clone());
         selected.push(candidate.clone());
         if selected.len() == top {
+            sort_selected(&mut selected);
             return selected;
         }
     }
@@ -472,7 +497,11 @@ fn select_diverse(
         let name = candidate.domain.split('.').next().unwrap_or_default();
         let prefix = matched_prefix(name);
         let suffix = matched_suffix(name);
-        if family_counts.get(&family).copied().unwrap_or(0) >= 2
+        let dense_fragments = dense_family_fragments(name);
+        if family_counts.get(&family).copied().unwrap_or(0) >= family_limit
+            || dense_fragments.iter().any(|fragment| {
+                dense_fragment_counts.get(fragment).copied().unwrap_or(0) >= dense_fragment_limit
+            })
             || prefix
                 .is_some_and(|value| prefix_counts.get(value).copied().unwrap_or(0) >= affix_limit)
             || suffix
@@ -491,6 +520,9 @@ fn select_diverse(
             if let Some(value) = suffix {
                 *suffix_counts.entry(value).or_default() += 1;
             }
+            for fragment in dense_fragments {
+                *dense_fragment_counts.entry(fragment).or_default() += 1;
+            }
             if let Some(initial) = name.bytes().next() {
                 *initial_counts.entry(initial).or_default() += 1;
             }
@@ -500,7 +532,27 @@ fn select_diverse(
             }
         }
     }
+    sort_selected(&mut selected);
     selected
+}
+
+fn dense_family_fragments(name: &str) -> Vec<&'static str> {
+    DENSE_FAMILY_FRAGMENTS
+        .iter()
+        .copied()
+        .filter(|fragment| name.contains(fragment))
+        .collect()
+}
+
+fn sort_selected(candidates: &mut [ScoredCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .generation_quality
+            .total_score
+            .cmp(&left.generation_quality.total_score)
+            .then_with(|| right.scoring.total_score.cmp(&left.scoring.total_score))
+            .then_with(|| left.domain.cmp(&right.domain))
+    });
 }
 
 fn is_reserved_collision(name: &str) -> bool {
@@ -519,6 +571,14 @@ fn matched_suffix(name: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|suffix| name.ends_with(suffix))
+}
+
+fn matched_dense_family_fragments(name: &str) -> Vec<&'static str> {
+    DENSE_FAMILY_FRAGMENTS
+        .iter()
+        .copied()
+        .filter(|fragment| name.contains(fragment))
+        .collect()
 }
 
 const FLUENT_BIGRAMS: &[&str] = &[
@@ -571,6 +631,11 @@ fn generation_quality_score(name: &str) -> GenerationQualityScore {
 
     let mut reasons = Vec::new();
     let mut penalty = (unlikely_bigrams * 7).min(21) as i16;
+    let dense_family_hits = matched_dense_family_fragments(name).len();
+    if dense_family_hits > 0 {
+        penalty += (dense_family_hits * 4) as i16;
+        reasons.push("common generated phonetic family".to_string());
+    }
     let coverage = if bigrams.is_empty() {
         0
     } else {
@@ -735,8 +800,25 @@ fn is_premium_name(name: &str) -> bool {
     (5..=10).contains(&name.len())
         && name.bytes().all(|byte| byte.is_ascii_lowercase())
         && !NEGATIVE_PARTS.iter().any(|part| name.contains(part))
+        && !has_artificial_onset(name)
         && longest_consonant_cluster(name) < 4
         && longest_repeated_run(name) < 3
+}
+
+fn has_artificial_onset(name: &str) -> bool {
+    if ARTIFICIAL_ONSETS
+        .iter()
+        .any(|onset| name.starts_with(onset))
+    {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    if bytes.len() < 2 || VOWELS.contains(&bytes[0]) || VOWELS.contains(&bytes[1]) {
+        return false;
+    }
+    !NATURAL_CONSONANT_ONSETS
+        .iter()
+        .any(|onset| name.starts_with(onset))
 }
 
 fn longest_consonant_cluster(name: &str) -> usize {
@@ -770,13 +852,18 @@ fn longest_repeated_run(name: &str) -> usize {
 }
 
 fn family_signature(domain: &str) -> String {
-    domain
-        .split('.')
-        .next()
-        .unwrap_or_default()
+    let name = domain.split('.').next().unwrap_or_default();
+    let suffix_start = name.len().saturating_sub(4);
+    let suffix = &name[suffix_start..];
+    suffix
         .bytes()
-        .filter(|byte| !VOWELS.contains(byte))
-        .map(char::from)
+        .map(|byte| {
+            if VOWELS.contains(&byte) {
+                'v'
+            } else {
+                char::from(byte)
+            }
+        })
         .collect()
 }
 
@@ -791,6 +878,7 @@ mod tests {
             tld: tld.to_string(),
             min_length: 5,
             max_length: 10,
+            min_generation_quality: 0,
         }
     }
 
@@ -832,7 +920,7 @@ mod tests {
                 .entry(family_signature(&candidate.domain))
                 .or_insert(0usize) += 1;
         }
-        assert!(families.values().all(|count| *count <= 2));
+        assert!(families.values().all(|count| *count <= 7));
     }
 
     #[test]
@@ -924,6 +1012,84 @@ mod tests {
             .windows(2)
             .all(|pair| pair[0].generation_quality.total_score
                 >= pair[1].generation_quality.total_score));
+    }
+
+    #[test]
+    fn minimum_generation_quality_filters_deterministically() {
+        let mut strict = config(20_000, 40, "com");
+        strict.min_length = 6;
+        strict.max_length = 6;
+        strict.min_generation_quality = 70;
+        let first = generate_premium_candidates(&strict);
+        let second = generate_premium_candidates(&strict);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 40);
+        assert!(first
+            .iter()
+            .all(|candidate| candidate.generation_quality.total_score >= 70));
+    }
+
+    #[test]
+    fn artificial_initial_clusters_are_rejected() {
+        for name in [
+            "dlaral", "bnavan", "tnoris", "fnavad", "knorap", "hnavik", "mnanuv", "rralun",
+            "sselas", "wnoril", "kmarav",
+        ] {
+            assert!(!is_premium_name(name), "{name} should be rejected");
+        }
+        for name in ["bravio", "cladine", "travis"] {
+            assert!(is_premium_name(name), "{name} should remain valid");
+        }
+    }
+
+    #[test]
+    fn dense_phonetic_fragments_are_capped_in_top_results() {
+        let mut strict = config(100_000, 100, "com");
+        strict.min_length = 6;
+        strict.max_length = 6;
+        strict.min_generation_quality = 70;
+        let candidates = generate_premium_candidates(&strict);
+        assert_eq!(candidates.len(), 100);
+        for fragment in DENSE_FAMILY_FRAGMENTS {
+            let count = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .domain
+                        .split('.')
+                        .next()
+                        .unwrap()
+                        .contains(fragment)
+                })
+                .count();
+            assert!(count <= 4, "fragment {fragment} appeared {count} times");
+        }
+    }
+
+    #[test]
+    fn exclusions_are_replaced_with_new_quality_candidates() {
+        let mut strict = config(20_000, 20, "com");
+        strict.min_length = 6;
+        strict.max_length = 6;
+        strict.min_generation_quality = 70;
+        let first = generate_premium_candidates(&strict);
+        let excluded_domains = first
+            .iter()
+            .map(|candidate| candidate.domain.clone())
+            .collect::<HashSet<_>>();
+        let (second, skipped) = generate_premium_candidates_with_filters_and_stats(
+            &strict,
+            &CandidateGenerationFilters {
+                excluded_domains: excluded_domains.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(second.len(), 20);
+        assert!(skipped > 0);
+        assert!(second.iter().all(|candidate| {
+            candidate.generation_quality.total_score >= 70
+                && !excluded_domains.contains(&candidate.domain)
+        }));
     }
 
     #[test]

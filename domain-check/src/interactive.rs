@@ -92,6 +92,9 @@ fn run_wizard_with_io(
     args.tlds = Some(vec![tld]);
     args.score_only = score_only;
     args.score = !score_only;
+    if score_only && args.min_generation_quality.is_none() {
+        args.min_generation_quality = Some(0);
+    }
     args.interactive = false;
     Ok(())
 }

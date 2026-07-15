@@ -55,6 +55,7 @@ fn test_help_shows_premium_generation_flags() {
         .stdout(predicate::str::contains("--contains <TEXT>"))
         .stdout(predicate::str::contains("--starts-with <TEXT>"))
         .stdout(predicate::str::contains("--ends-with <TEXT>"))
+        .stdout(predicate::str::contains("--min-generation-quality <0-100>"))
         .stdout(predicate::str::contains("--score-only"));
 }
 
@@ -75,6 +76,8 @@ fn test_generated_text_filters_and_determinism() {
             "5",
             flag,
             value,
+            "--min-generation-quality",
+            "0",
             "--score-only",
         ];
         let first = Command::cargo_bin("domain-check")
@@ -191,6 +194,8 @@ fn test_exact_generated_length_in_text_csv_and_json() {
             "100",
             "--length",
             "5",
+            "--min-generation-quality",
+            "0",
             "--score-only",
         ];
         if let Some(format) = format {
@@ -238,6 +243,8 @@ fn test_generated_length_range() {
             "6",
             "--max-length",
             "7",
+            "--min-generation-quality",
+            "0",
             "--score-only",
         ])
         .output()
@@ -303,6 +310,8 @@ fn test_score_only_text_is_deterministic_and_network_free() {
         "20",
         "--tld",
         ".COM",
+        "--min-generation-quality",
+        "0",
         "--score-only",
     ];
     let first = Command::cargo_bin("domain-check")
@@ -327,7 +336,16 @@ fn test_score_only_text_is_deterministic_and_network_free() {
 #[test]
 fn test_score_only_csv_schema() {
     let mut cmd = Command::cargo_bin("domain-check").unwrap();
-    cmd.args(["--generate", "50", "--top", "5", "--score-only", "--csv"]);
+    cmd.args([
+        "--generate",
+        "50",
+        "--top",
+        "5",
+        "--min-generation-quality",
+        "0",
+        "--score-only",
+        "--csv",
+    ]);
     cmd.assert()
         .success()
         .stdout(predicate::str::starts_with(
@@ -340,7 +358,16 @@ fn test_score_only_csv_schema() {
 fn test_score_only_json_schema() {
     let output = Command::cargo_bin("domain-check")
         .unwrap()
-        .args(["--generate", "50", "--top", "5", "--score-only", "--json"])
+        .args([
+            "--generate",
+            "50",
+            "--top",
+            "5",
+            "--min-generation-quality",
+            "0",
+            "--score-only",
+            "--json",
+        ])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -350,6 +377,120 @@ fn test_score_only_json_schema() {
     assert!(json[0]["scoring"]["total_score"].is_number());
     assert!(json[0]["scoring"]["reasons"].is_array());
     assert!(json[0]["generation_quality"]["total_score"].is_number());
+}
+
+#[test]
+fn test_minimum_generation_quality_is_validated_and_enforced() {
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--generate",
+            "100",
+            "--top",
+            "5",
+            "--min-generation-quality",
+            "101",
+            "--score-only",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("between 0 and 100"));
+
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--generate",
+            "100",
+            "--top",
+            "100",
+            "--length",
+            "6",
+            "--min-generation-quality",
+            "100",
+            "--score-only",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("generation quality >= 100"));
+}
+
+#[test]
+fn test_generated_network_text_shows_generation_quality() {
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--generate",
+            "2000",
+            "--top",
+            "1",
+            "--length",
+            "6",
+            "--min-generation-quality",
+            "70",
+            "--score",
+            "--no-history",
+        ])
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Generation quality:"));
+}
+
+#[test]
+fn test_generated_network_csv_adds_quality_columns() {
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--generate",
+            "2000",
+            "--top",
+            "1",
+            "--length",
+            "6",
+            "--csv",
+            "--no-history",
+        ])
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with(
+            "domain,available,registrar,created,expires,method,generation_quality_score",
+        ));
+}
+
+#[test]
+fn test_history_and_quality_threshold_fill_with_a_new_candidate() {
+    let dir = tempdir().unwrap();
+    let history = dir.path().join("generated-history.jsonl");
+    let args = [
+        "--generate",
+        "5000",
+        "--top",
+        "1",
+        "--length",
+        "6",
+        "--min-generation-quality",
+        "70",
+        "--score",
+        "--history-file",
+        history.to_str().unwrap(),
+    ];
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args(args)
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 new queries"));
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .args(args)
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 skipped"))
+        .stdout(predicate::str::contains("1 new queries"))
+        .stdout(predicate::str::contains("Generation quality:"));
 }
 
 #[test]
@@ -835,6 +976,7 @@ detailed_info = true
         config_path.to_str().unwrap(),
         "google.com",
         "--batch",
+        "--no-history",
     ]);
 
     cmd.assert()
@@ -847,7 +989,7 @@ fn test_env_detailed_info_respected_without_flag() {
     // DC_DETAILED_INFO=true should enable detailed info even without --info
     let mut cmd = Command::cargo_bin("domain-check").unwrap();
     cmd.env("DC_DETAILED_INFO", "true")
-        .args(["google.com", "--batch"]);
+        .args(["google.com", "--batch", "--no-history"]);
 
     cmd.assert()
         .success()

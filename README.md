@@ -65,6 +65,9 @@ domain-check --generate 500000 --top 5000 --length 5 -t com --score-only --csv >
 # Generate labels in an inclusive length range
 domain-check --generate 100000 --top 1000 --min-length 6 --max-length 8 -t com --score-only
 
+# Require stronger generator-specific linguistic quality (default: 70)
+domain-check --generate 100000 --top 100 --length 6 --min-generation-quality 75 -t com --score
+
 # Require letters in the second-level label
 domain-check --generate 500000 --top 500 --length 5 --contains ai -t com --score --csv
 
@@ -89,6 +92,12 @@ fails instead of silently returning a shorter list.
 
 `--contains`, `--starts-with`, and `--ends-with` constrain only the generated second-level label.
 They can be combined, and generation remains deterministic for identical inputs.
+
+`--min-generation-quality <0-100>` filters the generator-specific phonotactic score before
+selection. It defaults to 70 in both offline and real-query generation; pass `0` to inspect the
+unfiltered tail. If the requested `--top` cannot be filled above the threshold, the command fails
+with guidance to enlarge `--generate` or lower the threshold. Generated network text, CSV, and JSON
+output includes the generation-quality score and its reasons.
 
 Network checks use a project-local `.domain-check-history.jsonl` file by default. Previously seen
 `AVAILABLE` and `TAKEN` results are reused without another request; `UNKNOWN` results are retried
