@@ -168,6 +168,15 @@ pub struct Args {
     )]
     pub min_generation_quality: Option<u8>,
 
+    /// Maximum generated candidates selected from one phonetic family
+    #[arg(
+        long = "max-per-family",
+        value_name = "N",
+        default_value = "2",
+        help_heading = "Domain Generation"
+    )]
+    pub max_per_family: usize,
+
     /// Output results in JSON format
     #[arg(short = 'j', long = "json", help_heading = "Output Format")]
     pub json: bool,
@@ -371,6 +380,9 @@ fn validate_args(args: &Args) -> Result<(), String> {
         if args.min_generation_quality.is_some_and(|value| value > 100) {
             return Err("--min-generation-quality must be between 0 and 100".to_string());
         }
+        if args.max_per_family == 0 {
+            return Err("--max-per-family must be greater than zero".to_string());
+        }
     } else if args.top.is_some()
         || args.score_only
         || args.length.is_some()
@@ -535,6 +547,17 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
             )
         })
         .collect();
+    let generation_families: std::collections::HashMap<String, String> = generated
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|candidate| {
+            (
+                history::normalize_domain(&candidate.domain),
+                candidate.family_key.clone(),
+            )
+        })
+        .collect();
 
     // Pre-warm bootstrap cache if --all mode is requested (so get_all_known_tlds()
     // returns the full ~1,180 TLDs from IANA, not just the 32 hardcoded ones)
@@ -599,6 +622,7 @@ async fn run_domain_check(mut args: Args) -> Result<(), Box<dyn std::error::Erro
     let output_context = RunOutputContext {
         history_stats,
         generation_quality: &generation_quality,
+        generation_families: &generation_families,
     };
 
     // Interactive confirmation for large runs (TTY only)
@@ -670,6 +694,28 @@ struct HistoryStats {
 struct RunOutputContext<'a> {
     history_stats: HistoryStats,
     generation_quality: &'a std::collections::HashMap<String, GenerationQualityScore>,
+    generation_families: &'a std::collections::HashMap<String, String>,
+}
+
+fn print_diversity_stats(families: &std::collections::HashMap<String, String>, structured: bool) {
+    if families.is_empty() {
+        return;
+    }
+    let mut counts = std::collections::HashMap::new();
+    for family in families.values() {
+        *counts.entry(family).or_insert(0usize) += 1;
+    }
+    let largest = counts.values().copied().max().unwrap_or(0);
+    let line = format!(
+        "Diversity: {} unique families, largest family size {}",
+        counts.len(),
+        largest
+    );
+    if structured {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
 }
 
 fn history_path(args: &Args) -> PathBuf {
@@ -883,6 +929,7 @@ async fn run_streaming_check(
         );
     }
     print_history_stats(output_context.history_stats, args.json || args.csv);
+    print_diversity_stats(output_context.generation_families, args.json || args.csv);
 
     Ok(())
 }
@@ -943,8 +990,15 @@ async fn run_batch_check(
     }
 
     // Display results based on format
-    display_results(&results, args, duration, output_context.generation_quality)?;
+    display_results(
+        &results,
+        args,
+        duration,
+        output_context.generation_quality,
+        output_context.generation_families,
+    )?;
     print_history_stats(output_context.history_stats, is_structured);
+    print_diversity_stats(output_context.generation_families, is_structured);
 
     Ok(())
 }
@@ -1452,6 +1506,7 @@ fn generated_candidates_from_args(
             min_length,
             max_length,
             min_generation_quality,
+            max_per_family: args.max_per_family,
         },
         &CandidateGenerationFilters {
             contains: args
@@ -1476,10 +1531,11 @@ fn generated_candidates_from_args(
             format!(" with a {min_length}..={max_length}-character label")
         };
         return Err(format!(
-            "Could only generate {} valid unique candidates{} at generation quality >= {} (requested {}); increase --generate, lower --min-generation-quality, or widen the length range",
+            "Could only generate {} diverse valid candidates{} at generation quality >= {} with max {} per family (requested {}); increase --generate, lower --min-generation-quality, raise --max-per-family, or widen the length range",
             candidates.len(),
             length_requirement,
             min_generation_quality,
+            args.max_per_family,
             top
         )
         .into());
@@ -1510,18 +1566,25 @@ fn display_score_only(
             );
         }
     }
+    let families = candidates
+        .iter()
+        .map(|candidate| (candidate.domain.clone(), candidate.family_key.clone()))
+        .collect();
+    // Keep generated data on stdout machine-readable; summaries consistently use stderr.
+    print_diversity_stats(&families, true);
     Ok(())
 }
 
 fn render_score_only_csv(candidates: &[ScoredCandidate]) -> String {
     let mut output = String::from(
-        "domain,investment_score,generation_quality_score,phonotactic_score,boundary_score,rhythm_score,naturalness_score,generation_penalty,length_score,pronounceability_score,spelling_score,commercial_score,risk_penalty,reasons,generation_reasons\n",
+        "domain,family_key,investment_score,generation_quality_score,phonotactic_score,boundary_score,rhythm_score,naturalness_score,generation_penalty,length_score,pronounceability_score,spelling_score,commercial_score,risk_penalty,reasons,generation_reasons\n",
     );
     for candidate in candidates {
         let score = &candidate.scoring;
         output.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_escape(&candidate.domain),
+            csv_escape(&candidate.family_key),
             score.total_score,
             candidate.generation_quality.total_score,
             candidate.generation_quality.phonotactic_score,
@@ -1546,11 +1609,12 @@ fn display_results(
     args: &Args,
     duration: std::time::Duration,
     generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+    generation_families: &std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if args.json {
-        display_json_results(results, args.score, generation_quality)?;
+        display_json_results(results, args.score, generation_quality, generation_families)?;
     } else if args.csv {
-        display_csv_results(results, args.score, generation_quality)?;
+        display_csv_results(results, args.score, generation_quality, generation_families)?;
     } else {
         display_text_results(results, args, duration, generation_quality)?;
     }
@@ -1563,12 +1627,14 @@ fn display_json_results(
     results: &[domain_check_lib::DomainResult],
     include_score: bool,
     generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+    generation_families: &std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json = if include_score || !generation_quality.is_empty() {
         serde_json::to_string_pretty(&enriched_json_value(
             results,
             include_score,
             generation_quality,
+            generation_families,
         )?)?
     } else {
         serde_json::to_string_pretty(results)?
@@ -1579,13 +1645,19 @@ fn display_json_results(
 
 #[cfg(test)]
 fn scored_json_value(results: &[DomainResult]) -> Result<serde_json::Value, serde_json::Error> {
-    enriched_json_value(results, true, &std::collections::HashMap::new())
+    enriched_json_value(
+        results,
+        true,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    )
 }
 
 fn enriched_json_value(
     results: &[DomainResult],
     include_score: bool,
     generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+    generation_families: &std::collections::HashMap<String, String>,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let values = results
         .iter()
@@ -1606,6 +1678,11 @@ fn enriched_json_value(
                         serde_json::to_value(quality)?,
                     );
                 }
+                if let Some(family) =
+                    generation_families.get(&history::normalize_domain(&result.domain))
+                {
+                    object.insert("family_key".to_string(), serde_json::json!(family));
+                }
             }
             Ok(value)
         })
@@ -1618,23 +1695,35 @@ fn display_csv_results(
     results: &[domain_check_lib::DomainResult],
     include_score: bool,
     generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+    generation_families: &std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     print!(
         "{}",
-        render_csv_results_with_generation(results, include_score, generation_quality)
+        render_csv_results_with_generation(
+            results,
+            include_score,
+            generation_quality,
+            generation_families,
+        )
     );
     Ok(())
 }
 
 #[cfg(test)]
 fn render_csv_results(results: &[DomainResult], include_score: bool) -> String {
-    render_csv_results_with_generation(results, include_score, &std::collections::HashMap::new())
+    render_csv_results_with_generation(
+        results,
+        include_score,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    )
 }
 
 fn render_csv_results_with_generation(
     results: &[DomainResult],
     include_score: bool,
     generation_quality: &std::collections::HashMap<String, GenerationQualityScore>,
+    generation_families: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut output = String::new();
     if include_score {
@@ -1644,7 +1733,7 @@ fn render_csv_results_with_generation(
     }
     if !generation_quality.is_empty() {
         output.truncate(output.len() - 1);
-        output.push_str(",generation_quality_score,phonotactic_score,boundary_score,rhythm_score,naturalness_score,generation_penalty,generation_reasons\n");
+        output.push_str(",family_key,generation_quality_score,phonotactic_score,boundary_score,rhythm_score,naturalness_score,generation_penalty,generation_reasons\n");
     }
 
     for result in results {
@@ -1701,7 +1790,13 @@ fn render_csv_results_with_generation(
                 generation_quality.get(&history::normalize_domain(&result.domain))
             {
                 output.push_str(&format!(
-                    ",{},{},{},{},{},{},{}",
+                    ",{},{},{},{},{},{},{},{}",
+                    csv_escape(
+                        generation_families
+                            .get(&history::normalize_domain(&result.domain))
+                            .map(String::as_str)
+                            .unwrap_or_default()
+                    ),
                     quality.total_score,
                     quality.phonotactic_score,
                     quality.boundary_score,
@@ -1711,7 +1806,7 @@ fn render_csv_results_with_generation(
                     csv_escape(&quality.reasons.join(" | "))
                 ));
             } else {
-                output.push_str(",,,,,,,");
+                output.push_str(",,,,,,,,");
             }
         }
         output.push('\n');
@@ -1827,6 +1922,7 @@ mod tests {
             ends_with: None,
             score_only: false,
             min_generation_quality: None,
+            max_per_family: 2,
             no_history: false,
             history_file: None,
             clear_history: false,
@@ -1988,9 +2084,10 @@ mod tests {
             min_length: 5,
             max_length: 10,
             min_generation_quality: 0,
+            max_per_family: 2,
         });
         let csv = render_score_only_csv(&candidates);
-        assert!(csv.starts_with("domain,investment_score,generation_quality_score"));
+        assert!(csv.starts_with("domain,family_key,investment_score,generation_quality_score"));
         assert_eq!(csv.lines().count(), 3);
         assert!(!csv.contains("available"));
     }
@@ -2103,6 +2200,7 @@ mod tests {
             min_length: 6,
             max_length: 6,
             min_generation_quality: 0,
+            max_per_family: 2,
         })
         .remove(0);
         let domain = candidate.domain.clone();
@@ -2112,12 +2210,17 @@ mod tests {
         )]);
         let result = output_test_result(&domain);
 
-        let json = enriched_json_value(std::slice::from_ref(&result), true, &quality).unwrap();
+        let families = std::collections::HashMap::from([(
+            history::normalize_domain(&domain),
+            candidate.family_key,
+        )]);
+        let json =
+            enriched_json_value(std::slice::from_ref(&result), true, &quality, &families).unwrap();
         assert!(json[0]["available"].is_boolean());
         assert!(json[0]["scoring"]["total_score"].is_number());
         assert!(json[0]["generation_quality"]["total_score"].is_number());
 
-        let csv = render_csv_results_with_generation(&[result], true, &quality);
+        let csv = render_csv_results_with_generation(&[result], true, &quality, &families);
         assert!(csv.contains("investment_score"));
         assert!(csv.contains("generation_quality_score"));
         assert!(csv.contains(&domain));

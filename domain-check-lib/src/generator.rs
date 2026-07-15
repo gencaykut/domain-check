@@ -153,6 +153,8 @@ pub struct CandidateGenerationConfig {
     pub max_length: usize,
     /// Minimum generator-specific linguistic quality accepted for selection.
     pub min_generation_quality: u8,
+    /// Maximum selected candidates assigned to the same phonetic family.
+    pub max_per_family: usize,
 }
 
 /// Optional second-level label filters for premium generation.
@@ -170,6 +172,8 @@ pub struct ScoredCandidate {
     pub domain: String,
     pub scoring: InvestmentScore,
     pub generation_quality: GenerationQualityScore,
+    /// Deterministic key for the phonetic family used during diverse selection.
+    pub family_key: String,
     #[serde(skip)]
     pattern_index: usize,
 }
@@ -229,6 +233,7 @@ pub fn generate_premium_candidates_with_filters_and_stats(
         || config.max_length > 10
         || config.min_length > config.max_length
         || config.min_generation_quality > 100
+        || config.max_per_family == 0
     {
         return (Vec::new(), 0);
     }
@@ -302,6 +307,7 @@ pub fn generate_premium_candidates_with_filters_and_stats(
         candidates.push(ScoredCandidate {
             scoring,
             generation_quality,
+            family_key: family_key(&name),
             domain,
             pattern_index,
         });
@@ -321,6 +327,7 @@ pub fn generate_premium_candidates_with_filters_and_stats(
             config.top.min(config.count),
             generation_families,
             &filters,
+            config.max_per_family,
         ),
         excluded_count,
     )
@@ -428,18 +435,31 @@ fn select_diverse(
     top: usize,
     generation_families: usize,
     filters: &CandidateGenerationFilters,
+    max_per_family: usize,
 ) -> Vec<ScoredCandidate> {
     let per_pattern_limit = top.div_ceil(generation_families).max(1);
     let mut selected = Vec::with_capacity(top);
     let mut selected_domains = HashSet::new();
     let mut pattern_counts = vec![0usize; generation_families];
-    let mut family_counts: HashMap<String, usize> = HashMap::new();
+    let mut families: Vec<(String, String, usize)> = Vec::new();
     let mut prefix_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut suffix_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut dense_fragment_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut initial_counts: HashMap<u8, usize> = HashMap::new();
     let affix_limit = top.div_ceil(100).clamp(2, 10);
-    let family_limit = top.div_ceil(15).max(2);
+    let family_limit = max_per_family;
+    let start_bigram_limit = if filters.starts_with.is_some() {
+        top
+    } else {
+        top.div_ceil(12).max(3)
+    };
+    let start_trigram_limit = if filters.starts_with.is_some() {
+        top
+    } else {
+        top.div_ceil(25).max(2)
+    };
+    let mut start_bigram_counts: HashMap<String, usize> = HashMap::new();
+    let mut start_trigram_counts: HashMap<String, usize> = HashMap::new();
     let dense_fragment_limit = top.div_ceil(30).max(2);
     let initial_limit = if filters.starts_with.is_some() {
         top
@@ -448,13 +468,22 @@ fn select_diverse(
     };
 
     for candidate in &candidates {
-        let family = family_signature(&candidate.domain);
         let name = candidate.domain.split('.').next().unwrap_or_default();
+        let family_index = matching_family_index(name, &families);
+        let family_count = family_index.map_or(0, |index| families[index].2);
+        let start_bigram = prefix_chars(name, 2);
+        let start_trigram = prefix_chars(name, 3);
         let prefix = matched_prefix(name);
         let suffix = matched_suffix(name);
         let dense_fragments = dense_family_fragments(name);
         if pattern_counts[candidate.pattern_index] >= per_pattern_limit
-            || family_counts.get(&family).copied().unwrap_or(0) >= family_limit
+            || family_count >= family_limit
+            || start_bigram_counts.get(&start_bigram).copied().unwrap_or(0) >= start_bigram_limit
+            || start_trigram_counts
+                .get(&start_trigram)
+                .copied()
+                .unwrap_or(0)
+                >= start_trigram_limit
             || dense_fragments.iter().any(|fragment| {
                 dense_fragment_counts.get(fragment).copied().unwrap_or(0) >= dense_fragment_limit
             })
@@ -469,7 +498,10 @@ fn select_diverse(
             continue;
         }
         pattern_counts[candidate.pattern_index] += 1;
-        *family_counts.entry(family).or_default() += 1;
+        let mut selected_candidate = candidate.clone();
+        assign_family(&mut selected_candidate, name, family_index, &mut families);
+        *start_bigram_counts.entry(start_bigram).or_default() += 1;
+        *start_trigram_counts.entry(start_trigram).or_default() += 1;
         if let Some(value) = prefix {
             *prefix_counts.entry(value).or_default() += 1;
         }
@@ -483,7 +515,7 @@ fn select_diverse(
             *initial_counts.entry(initial).or_default() += 1;
         }
         selected_domains.insert(candidate.domain.clone());
-        selected.push(candidate.clone());
+        selected.push(selected_candidate);
         if selected.len() == top {
             sort_selected(&mut selected);
             return selected;
@@ -493,12 +525,26 @@ fn select_diverse(
     // Relax only the pattern balance when necessary. Lexical-family and affix caps remain hard so
     // the tail of a large list cannot undo the diversity guarantees applied above.
     for candidate in candidates {
-        let family = family_signature(&candidate.domain);
-        let name = candidate.domain.split('.').next().unwrap_or_default();
-        let prefix = matched_prefix(name);
-        let suffix = matched_suffix(name);
-        let dense_fragments = dense_family_fragments(name);
-        if family_counts.get(&family).copied().unwrap_or(0) >= family_limit
+        let name = candidate
+            .domain
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let family_index = matching_family_index(&name, &families);
+        let family_count = family_index.map_or(0, |index| families[index].2);
+        let start_bigram = prefix_chars(&name, 2);
+        let start_trigram = prefix_chars(&name, 3);
+        let prefix = matched_prefix(&name);
+        let suffix = matched_suffix(&name);
+        let dense_fragments = dense_family_fragments(&name);
+        if family_count >= family_limit
+            || start_bigram_counts.get(&start_bigram).copied().unwrap_or(0) >= start_bigram_limit
+            || start_trigram_counts
+                .get(&start_trigram)
+                .copied()
+                .unwrap_or(0)
+                >= start_trigram_limit
             || dense_fragments.iter().any(|fragment| {
                 dense_fragment_counts.get(fragment).copied().unwrap_or(0) >= dense_fragment_limit
             })
@@ -513,7 +559,10 @@ fn select_diverse(
             continue;
         }
         if selected_domains.insert(candidate.domain.clone()) {
-            *family_counts.entry(family).or_default() += 1;
+            let mut candidate = candidate;
+            assign_family(&mut candidate, &name, family_index, &mut families);
+            *start_bigram_counts.entry(start_bigram).or_default() += 1;
+            *start_trigram_counts.entry(start_trigram).or_default() += 1;
             if let Some(value) = prefix {
                 *prefix_counts.entry(value).or_default() += 1;
             }
@@ -534,6 +583,32 @@ fn select_diverse(
     }
     sort_selected(&mut selected);
     selected
+}
+
+fn prefix_chars(name: &str, count: usize) -> String {
+    name.chars().take(count).collect()
+}
+
+fn matching_family_index(name: &str, families: &[(String, String, usize)]) -> Option<usize> {
+    families
+        .iter()
+        .position(|(_, representative, _)| same_phonetic_family(name, representative))
+}
+
+fn assign_family(
+    candidate: &mut ScoredCandidate,
+    name: &str,
+    family_index: Option<usize>,
+    families: &mut Vec<(String, String, usize)>,
+) {
+    if let Some(index) = family_index {
+        families[index].2 += 1;
+        candidate.family_key = families[index].0.clone();
+    } else {
+        let key = family_key(name);
+        families.push((key.clone(), name.to_string(), 1));
+        candidate.family_key = key;
+    }
 }
 
 fn dense_family_fragments(name: &str) -> Vec<&'static str> {
@@ -851,20 +926,83 @@ fn longest_repeated_run(name: &str) -> usize {
     longest
 }
 
-fn family_signature(domain: &str) -> String {
-    let name = domain.split('.').next().unwrap_or_default();
-    let suffix_start = name.len().saturating_sub(4);
-    let suffix = &name[suffix_start..];
-    suffix
-        .bytes()
+/// Stable, human-readable key for a generated phonetic family.
+pub fn family_key(domain_or_name: &str) -> String {
+    let name = domain_or_name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let root = name.chars().take(3).collect::<String>();
+    let skeleton = consonant_skeleton(&name);
+    format!("{root}:{}", skeleton.chars().take(3).collect::<String>())
+}
+
+fn consonant_skeleton(name: &str) -> String {
+    name.bytes()
+        .filter(|byte| !VOWELS.contains(byte))
+        .map(char::from)
+        .collect()
+}
+
+fn normalized_vowels(name: &str) -> String {
+    name.bytes()
         .map(|byte| {
             if VOWELS.contains(&byte) {
-                'v'
+                'a'
             } else {
                 char::from(byte)
             }
         })
         .collect()
+}
+
+fn trigram_overlap(left: &str, right: &str) -> usize {
+    let left = left.as_bytes().windows(3).collect::<HashSet<_>>();
+    right
+        .as_bytes()
+        .windows(3)
+        .filter(|trigram| left.contains(trigram))
+        .count()
+}
+
+fn bounded_edit_distance(left: &str, right: &str, limit: usize) -> usize {
+    if left.len().abs_diff(right.len()) > limit {
+        return limit + 1;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (row, left_byte) in left.bytes().enumerate() {
+        let mut current = vec![row + 1];
+        let mut row_min = row + 1;
+        for (column, right_byte) in right.bytes().enumerate() {
+            let value = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(previous[column] + usize::from(left_byte != right_byte));
+            row_min = row_min.min(value);
+            current.push(value);
+        }
+        if row_min > limit {
+            return limit + 1;
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn same_phonetic_family(left: &str, right: &str) -> bool {
+    let left = left.split('.').next().unwrap_or_default();
+    let right = right.split('.').next().unwrap_or_default();
+    if left.chars().take(3).eq(right.chars().take(3)) {
+        return true;
+    }
+    let left_skeleton = consonant_skeleton(left);
+    let right_skeleton = consonant_skeleton(right);
+    let normalized_left = normalized_vowels(left);
+    let normalized_right = normalized_vowels(right);
+    let skeleton_close = left_skeleton == right_skeleton;
+    let root_close = bounded_edit_distance(&normalized_left, &normalized_right, 1) <= 1;
+    let overlap = trigram_overlap(&normalized_left, &normalized_right);
+    skeleton_close && root_close && overlap >= 2
 }
 
 #[cfg(test)]
@@ -879,6 +1017,7 @@ mod tests {
             min_length: 5,
             max_length: 10,
             min_generation_quality: 0,
+            max_per_family: 2,
         }
     }
 
@@ -917,10 +1056,10 @@ mod tests {
         let mut families = HashMap::new();
         for candidate in candidates {
             *families
-                .entry(family_signature(&candidate.domain))
+                .entry(candidate.family_key.clone())
                 .or_insert(0usize) += 1;
         }
-        assert!(families.values().all(|count| *count <= 7));
+        assert!(families.values().all(|count| *count <= 2));
     }
 
     #[test]
@@ -1040,6 +1179,65 @@ mod tests {
         for name in ["bravio", "cladine", "travis"] {
             assert!(is_premium_name(name), "{name} should remain valid");
         }
+    }
+
+    #[test]
+    fn related_nav_and_val_variants_share_families() {
+        let nav = [
+            "navane", "navare", "navere", "navale", "navali", "navias", "navion", "navior",
+        ];
+        let val = [
+            "valaro", "valina", "valian", "valiar", "valene", "valere", "valore",
+        ];
+        for variants in [nav.as_slice(), val.as_slice()] {
+            for variant in &variants[1..] {
+                assert!(
+                    same_phonetic_family(variants[0], variant),
+                    "{} and {variant} should share a family",
+                    variants[0]
+                );
+            }
+        }
+        assert!(!same_phonetic_family("navane", "zelori"));
+    }
+
+    #[test]
+    fn configured_family_quota_is_hard_and_deterministic() {
+        let mut strict = config(100_000, 100, "com");
+        strict.min_length = 6;
+        strict.max_length = 6;
+        strict.min_generation_quality = 70;
+        strict.max_per_family = 1;
+        let first = generate_premium_candidates(&strict);
+        let second = generate_premium_candidates(&strict);
+        assert_eq!(first, second);
+        let mut counts = HashMap::new();
+        for candidate in first {
+            *counts.entry(candidate.family_key).or_insert(0usize) += 1;
+        }
+        assert!(counts.values().all(|count| *count <= 1));
+    }
+
+    #[test]
+    fn default_top_hundred_caps_families_and_starting_ngrams() {
+        let mut strict = config(500_000, 100, "com");
+        strict.min_length = 6;
+        strict.max_length = 6;
+        strict.min_generation_quality = 70;
+        let candidates = generate_premium_candidates(&strict);
+        assert_eq!(candidates.len(), 100);
+        let mut families = HashMap::new();
+        let mut bigrams = HashMap::new();
+        let mut trigrams = HashMap::new();
+        for candidate in candidates {
+            let name = candidate.domain.split('.').next().unwrap();
+            *families.entry(candidate.family_key).or_insert(0usize) += 1;
+            *bigrams.entry(prefix_chars(name, 2)).or_insert(0usize) += 1;
+            *trigrams.entry(prefix_chars(name, 3)).or_insert(0usize) += 1;
+        }
+        assert!(families.values().all(|count| *count <= 2));
+        assert!(bigrams.values().all(|count| *count <= 9));
+        assert!(trigrams.values().all(|count| *count <= 4));
     }
 
     #[test]

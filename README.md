@@ -66,7 +66,7 @@ domain-check --generate 500000 --top 5000 --length 5 -t com --score-only --csv >
 domain-check --generate 100000 --top 1000 --min-length 6 --max-length 8 -t com --score-only
 
 # Require stronger generator-specific linguistic quality (default: 70)
-domain-check --generate 100000 --top 100 --length 6 --min-generation-quality 75 -t com --score
+domain-check --generate 100000 --top 100 --length 6 --min-generation-quality 75 --max-per-family 2 -t com --score
 
 # Require letters in the second-level label
 domain-check --generate 500000 --top 500 --length 5 --contains ai -t com --score --csv
@@ -98,6 +98,11 @@ selection. It defaults to 70 in both offline and real-query generation; pass `0`
 unfiltered tail. If the requested `--top` cannot be filled above the threshold, the command fails
 with guidance to enlarge `--generate` or lower the threshold. Generated network text, CSV, and JSON
 output includes the generation-quality score and its reasons.
+
+`--max-per-family <N>` limits closely related phonetic variants (default `2`). Selection also
+caps repeated starting bigrams/trigrams and continues down the ranked pool to fill the requested
+count with different families. Text summaries report the unique-family count and largest family;
+generated CSV/JSON output includes `family_key`.
 
 Network checks use a project-local `.domain-check-history.jsonl` file by default. Previously seen
 `AVAILABLE` and `TAKEN` results are reused without another request; `UNKNOWN` results are retried

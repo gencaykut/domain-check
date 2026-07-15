@@ -68,6 +68,23 @@ fn run_wizard_with_io(
             }
         },
     )?;
+    let max_per_family = prompt_until(
+        input,
+        output,
+        "Aynı fonetik aileden en fazla kaç aday [2]?: ",
+        |value| {
+            if value.trim().is_empty() {
+                return Ok(2);
+            }
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "pozitif bir sayı girin")?;
+            (parsed > 0)
+                .then_some(parsed)
+                .ok_or("sayı sıfırdan büyük olmalı")
+        },
+    )?;
     let tld = prompt_until(input, output, "TLD [com]: ", |value| {
         let value = if value.trim().is_empty() {
             "com"
@@ -89,6 +106,7 @@ fn run_wizard_with_io(
 
     args.generate_count = Some(generate_count);
     args.top = Some(top);
+    args.max_per_family = max_per_family;
     args.tlds = Some(vec![tld]);
     args.score_only = score_only;
     args.score = !score_only;
@@ -178,13 +196,14 @@ mod tests {
     fn wizard_maps_answers_to_cli_arguments() {
         let mut args = crate::tests::create_test_args();
         args.interactive = true;
-        let mut input = Cursor::new(b"5\nai\n1\n5000\n500\n\n2\n");
+        let mut input = Cursor::new(b"5\nai\n1\n5000\n500\n2\n\n2\n");
         let mut output = Vec::new();
         run_wizard_with_io(&mut args, &mut input, &mut output).unwrap();
         assert_eq!(args.length, Some(5));
         assert_eq!(args.contains.as_deref(), Some("ai"));
         assert_eq!(args.generate_count, Some(5000));
         assert_eq!(args.top, Some(500));
+        assert_eq!(args.max_per_family, 2);
         assert_eq!(args.tlds, Some(vec!["com".to_string()]));
         assert!(!args.score_only);
         assert!(args.score);

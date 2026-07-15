@@ -135,6 +135,11 @@ pub fn print_custom_help() {
     );
     print_flag(
         "",
+        "--max-per-family <N>",
+        "Limit selected candidates from one phonetic family (default: 2)",
+    );
+    print_flag(
+        "",
         "--score-only",
         "Score candidates without network checks",
     );

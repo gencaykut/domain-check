@@ -56,6 +56,7 @@ fn test_help_shows_premium_generation_flags() {
         .stdout(predicate::str::contains("--starts-with <TEXT>"))
         .stdout(predicate::str::contains("--ends-with <TEXT>"))
         .stdout(predicate::str::contains("--min-generation-quality <0-100>"))
+        .stdout(predicate::str::contains("--max-per-family <N>"))
         .stdout(predicate::str::contains("--score-only"));
 }
 
@@ -166,7 +167,7 @@ fn test_no_history_does_not_create_custom_history_file() {
 fn test_interactive_wizard_accepts_simulated_stdin() {
     let mut cmd = Command::cargo_bin("domain-check").unwrap();
     cmd.arg("--interactive")
-        .write_stdin("5\nai\n1\n5000\n20\ncom\n1\n")
+        .write_stdin("5\nai\n1\n5000\n20\n2\ncom\n1\n")
         .assert()
         .success()
         .stderr(predicate::str::contains("Domain candidate wizard"))
@@ -349,7 +350,7 @@ fn test_score_only_csv_schema() {
     cmd.assert()
         .success()
         .stdout(predicate::str::starts_with(
-            "domain,investment_score,generation_quality_score,phonotactic_score",
+            "domain,family_key,investment_score,generation_quality_score,phonotactic_score",
         ))
         .stdout(predicate::str::contains("reasons\n"));
 }
@@ -454,7 +455,7 @@ fn test_generated_network_csv_adds_quality_columns() {
         .assert()
         .success()
         .stdout(predicate::str::starts_with(
-            "domain,available,registrar,created,expires,method,generation_quality_score",
+            "domain,available,registrar,created,expires,method,family_key,generation_quality_score",
         ));
 }
 
@@ -490,7 +491,40 @@ fn test_history_and_quality_threshold_fill_with_a_new_candidate() {
         .success()
         .stdout(predicate::str::contains("1 skipped"))
         .stdout(predicate::str::contains("1 new queries"))
-        .stdout(predicate::str::contains("Generation quality:"));
+        .stdout(predicate::str::contains("Generation quality:"))
+        .stdout(predicate::str::contains("Diversity: 1 unique families"));
+}
+
+#[test]
+fn test_max_per_family_is_enforced_in_top_hundred() {
+    let output = Command::cargo_bin("domain-check")
+        .unwrap()
+        .args([
+            "--generate",
+            "500000",
+            "--top",
+            "100",
+            "--length",
+            "6",
+            "--min-generation-quality",
+            "70",
+            "--max-per-family",
+            "2",
+            "--score-only",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let values: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut counts = std::collections::HashMap::new();
+    for candidate in values.as_array().unwrap() {
+        let key = candidate["family_key"].as_str().unwrap();
+        *counts.entry(key.to_string()).or_insert(0usize) += 1;
+    }
+    assert_eq!(values.as_array().unwrap().len(), 100);
+    assert!(counts.values().all(|count| *count <= 2));
+    assert!(counts.len() >= 50);
 }
 
 #[test]
