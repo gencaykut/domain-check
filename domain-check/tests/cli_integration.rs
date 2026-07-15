@@ -528,6 +528,57 @@ fn test_max_per_family_is_enforced_in_top_hundred() {
 }
 
 #[test]
+fn test_optional_dictionary_file_loads_once_without_changing_cli_contract() {
+    let dir = tempdir().unwrap();
+    let words = dir.path().join("words.txt");
+    fs::write(
+        &words,
+        "planet\nplaner\nplaned\nplanning\nbrand\nbranded\nclean\nclear\ncladine\n",
+    )
+    .unwrap();
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .env("DOMAIN_CHECK_WORDS_FILE", &words)
+        .args([
+            "--generate",
+            "500",
+            "--top",
+            "5",
+            "--min-generation-quality",
+            "0",
+            "--score-only",
+            "--csv",
+            "--verbose",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("domain,family_key"))
+        .stderr(predicate::str::contains("Dictionary model: 9 words"));
+
+    Command::cargo_bin("domain-check")
+        .unwrap()
+        .env(
+            "DOMAIN_CHECK_WORDS_FILE",
+            dir.path().join("missing-words.txt"),
+        )
+        .args([
+            "--generate",
+            "500",
+            "--top",
+            "5",
+            "--min-generation-quality",
+            "0",
+            "--score-only",
+            "--verbose",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Dictionary model: unavailable; using built-in generation heuristics",
+        ));
+}
+
+#[test]
 fn test_generate_input_conflicts_are_clear() {
     let cases = [
         vec!["manual", "--generate", "10"],

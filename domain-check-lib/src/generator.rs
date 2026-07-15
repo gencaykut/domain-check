@@ -1,5 +1,6 @@
 //! Deterministic, network-free generation of pronounceable domain candidates.
 
+use crate::dictionary::{optional_dictionary_model, DictionaryModel};
 use crate::{score_domain, InvestmentScore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -681,6 +682,13 @@ const SONORANTS: &[u8] = b"lrmnsvwy";
 const HARD_CONSONANTS: &[u8] = b"bdgjkptfch";
 
 fn generation_quality_score(name: &str) -> GenerationQualityScore {
+    generation_quality_score_with_dictionary(name, optional_dictionary_model())
+}
+
+fn generation_quality_score_with_dictionary(
+    name: &str,
+    dictionary: Option<&DictionaryModel>,
+) -> GenerationQualityScore {
     let bigrams: Vec<&str> = name
         .char_indices()
         .zip(name.char_indices().skip(2))
@@ -793,6 +801,22 @@ fn generation_quality_score(name: &str) -> GenerationQualityScore {
     if matched_prefix(name).is_some() || matched_suffix(name).is_some() {
         naturalness_score -= 2;
         reasons.push("generated affix requires semantic review".to_string());
+    }
+    if let Some(dictionary) = dictionary {
+        let signal = dictionary.signal(name);
+        naturalness_score += i16::from(signal.ngram_score) - 12;
+        if signal.ngram_score >= 15 {
+            reasons.push("dictionary n-gram support".to_string());
+        } else if signal.ngram_score <= 8 {
+            reasons.push("rare dictionary letter sequence".to_string());
+        }
+        if signal.exact_word {
+            penalty += 25;
+            reasons.push("exact English dictionary word".to_string());
+        } else if signal.one_edit_neighbor {
+            penalty += 12;
+            reasons.push("one-edit dictionary neighbor".to_string());
+        }
     }
     let naturalness_score = naturalness_score.clamp(0, 20) as u8;
     let penalty = penalty.clamp(0, 50) as u8;
@@ -1008,6 +1032,7 @@ fn same_phonetic_family(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn config(count: usize, top: usize, tld: &str) -> CandidateGenerationConfig {
         CandidateGenerationConfig {
@@ -1113,6 +1138,29 @@ mod tests {
     fn quality_filter_preserves_clean_brandable_examples() {
         let clean = generation_quality_score("cladine");
         assert!(clean.total_score >= 50, "cladine={clean:?}");
+    }
+
+    #[test]
+    fn optional_dictionary_signals_affect_quality_and_explain_collisions() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "planet\nplaner\nplaned\nplanning\nbrand\nbranded\nclean\nclear\ncladine"
+        )
+        .unwrap();
+        let model = DictionaryModel::load(file.path()).unwrap();
+        let baseline = generation_quality_score_with_dictionary("planet", None);
+        let exact = generation_quality_score_with_dictionary("planet", Some(&model));
+        let typo = generation_quality_score_with_dictionary("planat", Some(&model));
+        assert!(exact.total_score < baseline.total_score);
+        assert!(exact
+            .reasons
+            .iter()
+            .any(|reason| reason == "exact English dictionary word"));
+        assert!(typo
+            .reasons
+            .iter()
+            .any(|reason| reason == "one-edit dictionary neighbor"));
     }
 
     #[test]

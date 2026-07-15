@@ -12,9 +12,9 @@ use console::Term;
 #[cfg(test)]
 use domain_check_lib::generate_premium_candidates;
 use domain_check_lib::{
-    generate_premium_candidates_with_filters_and_stats, normalize_tld, score_domain,
-    CandidateGenerationConfig, CandidateGenerationFilters, CheckConfig, DomainChecker,
-    DomainResult, GenerationQualityScore, ScoredCandidate,
+    dictionary_model_stats, generate_premium_candidates_with_filters_and_stats, normalize_tld,
+    score_domain, CandidateGenerationConfig, CandidateGenerationFilters, CheckConfig,
+    DomainChecker, DomainResult, GenerationQualityScore, ScoredCandidate,
 };
 use domain_check_lib::{
     get_all_known_tlds, get_available_presets, get_preset_tlds, get_preset_tlds_with_custom,
@@ -1524,6 +1524,18 @@ fn generated_candidates_from_args(
             excluded_domains,
         },
     );
+    if args.verbose {
+        if let Some(stats) = dictionary_model_stats() {
+            eprintln!(
+                "Dictionary model: {} words, {:.1} MiB compact index, loaded in {} ms",
+                stats.words,
+                stats.estimated_bytes as f64 / (1024.0 * 1024.0),
+                stats.load_millis
+            );
+        } else {
+            eprintln!("Dictionary model: unavailable; using built-in generation heuristics");
+        }
+    }
     if candidates.len() != top {
         let length_requirement = if min_length == max_length {
             format!(" with a {min_length}-character label")

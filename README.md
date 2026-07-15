@@ -104,6 +104,25 @@ caps repeated starting bigrams/trigrams and continues down the ranked pool to fi
 count with different families. Text summaries report the unique-family count and largest family;
 generated CSV/JSON output includes `family_key`.
 
+### Optional English dictionary model
+
+Place a local `words_alpha.txt` in the working directory, or point
+`DOMAIN_CHECK_WORDS_FILE` at another newline-delimited lowercase English word list. The file is
+optional and is intentionally not bundled with the repository. If it is absent, the original
+built-in generation heuristics are used unchanged.
+
+The dictionary is read once on first generator use. It is converted in memory to compact 2-gram
+and 3-gram frequency tables plus sorted 64-bit exact/deletion hash indexes; candidate scoring never
+rescans the text file. Generated explanations can include `dictionary n-gram support`,
+`rare dictionary letter sequence`, `exact English dictionary word`, or
+`one-edit dictionary neighbor`. Use `--verbose` to print word count, estimated compact-index memory,
+and initial load time.
+
+```bash
+DOMAIN_CHECK_WORDS_FILE=/path/to/words_alpha.txt \
+  domain-check --generate 500000 --top 100 --length 6 -t com --score --verbose
+```
+
 Network checks use a project-local `.domain-check-history.jsonl` file by default. Previously seen
 `AVAILABLE` and `TAKEN` results are reused without another request; `UNKNOWN` results are retried
 after 24 hours. Use `--no-history` to bypass it, `--history-file <PATH>` to choose another JSONL

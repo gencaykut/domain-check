@@ -33,6 +33,9 @@ available-candidates.csv
 domain-results.csv
 domains.txt
 
+# Optional local dictionary data
+words_alpha.txt
+
 # Project-local persistent query history
 .domain-check-history.jsonl
 

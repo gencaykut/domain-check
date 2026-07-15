@@ -45,7 +45,10 @@ pub mod generate;
 pub mod generator;
 pub mod scoring;
 
+mod dictionary;
+
 // Re-export generation types for convenience
+pub use dictionary::{dictionary_model_stats, DictionaryModelStats};
 pub use generate::{apply_affixes, estimate_pattern_count, expand_pattern, generate_names};
 pub use generator::{
     family_key, generate_premium_candidates, generate_premium_candidates_with_filters,
